@@ -3,6 +3,10 @@
 .env.local
 .env.*.local
 my-env.sh
+.cursor/
+.env.example
+.gcloudignore
+env.example
 
 # Python
 __pycache__/
