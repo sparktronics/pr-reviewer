@@ -1,0 +1,5 @@
+requests>=2.31.0
+# Using the new Google GenAI SDK (replaces deprecated google-cloud-aiplatform)
+google-genai>=1.37.0
+# For loading environment variables from .env file
+python-dotenv>=1.0.0

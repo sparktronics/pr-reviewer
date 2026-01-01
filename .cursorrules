@@ -1,0 +1,175 @@
+# Cursor AI Rules for PR POC Script Project
+
+## File Creation Policy
+
+### ⚠️ ALWAYS ASK BEFORE CREATING NEW FILES
+
+**CRITICAL RULE**: Before creating any new file, you MUST:
+1. Ask the user for explicit permission
+2. Explain what the file will contain and why it's needed
+3. Wait for approval before proceeding
+
+### Especially for Documentation Files
+
+**NEVER** create these without explicit user request:
+- `.md` files (README, guides, documentation)
+- `.txt` files (notes, logs)
+- Example/template files
+- Configuration files (unless fixing a critical bug)
+
+**Example of correct behavior:**
+```
+❌ BAD: "I've created GUIDE.md with setup instructions..."
+✅ GOOD: "Would you like me to create a GUIDE.md file with setup instructions? It would include..."
+```
+
+## Project-Specific Rules
+
+### This is a Python script project for PR review automation
+
+**Stack:**
+- Python 3.13+
+- Google GenAI SDK (google-genai) for Vertex AI
+- Azure DevOps REST API
+- Environment variables via python-dotenv
+
+**Key files:**
+- `pr_regression_review.py` - Main script
+- `test_vertex.py` - Testing script
+- `requirements.txt` - Dependencies
+- `.env` - User's secrets (git-ignored)
+
+### Code Modifications
+
+**DO:**
+- Edit existing Python files when asked
+- Fix bugs and errors proactively
+- Improve code quality when explicitly requested
+- Update requirements.txt when adding dependencies
+
+**DON'T:**
+- Create helper scripts without asking
+- Generate example files unprompted
+- Create test files without request
+- Add unnecessary abstractions
+
+### Documentation Approach
+
+**ASK FIRST** before creating:
+- New markdown documentation
+- Code examples in separate files
+- Configuration templates
+- Migration guides
+- Tutorial files
+
+**You can update** without asking:
+- Existing README.md if explicitly editing it
+- Files the user is currently working on
+- Files with obvious typos/errors in active conversation
+
+## Communication Style
+
+### Be Concise
+- Get to the point quickly
+- Avoid lengthy explanations unless asked
+- Use bullet points over paragraphs
+- Show, don't tell (code examples > explanations)
+
+### No Unsolicited "Improvements"
+- Don't suggest refactoring unless code is broken
+- Don't propose "best practices" unprompted
+- Don't create abstractions "for the future"
+- Stick to solving the immediate problem
+
+### File Operations
+- **READ**: Go ahead when needed for context
+- **EDIT**: Go ahead for requested changes
+- **CREATE**: ASK FIRST, always
+- **DELETE**: Ask unless it's a temp file you created
+
+## Code Style for This Project
+
+### Python
+- Use type hints where helpful (function signatures)
+- Keep functions focused and simple
+- Comments only for non-obvious logic
+- Follow PEP 8, but readability > rules
+
+### Error Handling
+- Validate environment variables early
+- Provide clear error messages
+- Exit gracefully with sys.exit(1) on fatal errors
+- Don't catch exceptions unless you can handle them
+
+### Environment Variables
+- Use python-dotenv for loading .env
+- Always check required variables exist
+- Use os.getenv() with defaults for optional vars
+- Document required vars in docstring
+
+## Testing Approach
+
+- Test changes with `python3 -m py_compile` for syntax
+- Run actual scripts when possible
+- Don't create separate test files without asking
+- Inline testing/validation is preferred
+
+## Dependencies
+
+**When adding new dependencies:**
+1. Add to requirements.txt
+2. Install with pip3
+3. Mention it to the user
+4. Update relevant documentation
+
+**Prefer:**
+- Standard library when possible
+- Well-maintained, popular packages
+- Packages already in use (requests, dotenv, google-genai)
+
+## Security
+
+**NEVER:**
+- Print or log secrets/tokens
+- Commit .env files (ensure .gitignore)
+- Hardcode credentials
+- Create files with example secrets that look real
+
+**ALWAYS:**
+- Keep secrets in .env or environment
+- Add sensitive files to .gitignore
+- Use os.getenv() for secrets
+- Warn about security implications
+
+## Git Operations
+
+**NEVER without explicit request:**
+- Commit changes
+- Push to remote
+- Create branches
+- Modify git config
+- Force operations
+
+## Summary of "ASK FIRST" Rules
+
+🚫 Creating new .md files
+🚫 Creating new documentation
+🚫 Creating example/template files
+🚫 Creating test files
+🚫 Creating configuration files
+🚫 Committing to git
+🚫 Installing system packages
+🚫 Modifying .gitignore (unless security issue)
+
+✅ Editing existing files
+✅ Fixing bugs
+✅ Installing Python packages (with mention)
+✅ Reading files for context
+✅ Running commands for testing
+
+## When in Doubt
+
+**ASK THE USER!**
+
+It's always better to ask than to create unwanted files or make unwanted changes.
+
