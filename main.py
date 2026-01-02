@@ -714,9 +714,9 @@ def review_pr(request):
         if has_blocking or has_warning:
             logger.info(f"[ACTION] Posting review comment to PR #{pr_id}")
             # Post comment with full review
-            comment_header = "## 🤖 Automated Regression Review\n\n"
+            comment_header = "##  Automated Regression Review\n\n"
             if has_blocking:
-                comment_header += "⛔ **This PR has been automatically rejected due to blocking issues.**\n\n"
+                comment_header += "⛔ **Sorry Dave, I can't merge you this time. This PR has been automatically rejected due to blocking issues.**\n\n"
             else:
                 comment_header += "⚠️ **Warning: This PR has potential issues that should be reviewed.**\n\n"
             

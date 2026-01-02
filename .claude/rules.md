@@ -9,6 +9,11 @@
 - Use meaningful variable names; avoid single letters except for loops/lambdas
 - Keep functions focused and under 50 lines when possible
 
+## VERY IMPORTANT Coding Guidelines
+- Do not repeat code. Simplify in functions.
+- Apply simple responsibility principle 
+
+
 ### Imports
 - Group imports: stdlib, third-party, local (separated by blank lines)
 - Use absolute imports over relative imports
