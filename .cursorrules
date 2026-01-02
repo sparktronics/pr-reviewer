@@ -9,6 +9,9 @@
 2. Explain what the file will contain and why it's needed
 3. Wait for approval before proceeding
 
+## **CRITICAL RULE** Agents and Artifical Intelligence:
+1. Read the rules in `.claude/rules.md` 
+
 ### Especially for Documentation Files
 
 **NEVER** create these without explicit user request:

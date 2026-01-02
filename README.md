@@ -62,6 +62,9 @@ echo -n "your-azure-pat" | gcloud secrets create azure-devops-pat --data-file=-
 # Create API key for the function
 echo -n "your-api-key" | gcloud secrets create pr-review-api-key --data-file=-
 
+# or update
+echo -n "your-new-api-key" | gcloud secrets versions add pr-review-api-key --data-file=-
+
 # Grant Cloud Functions access to secrets
 gcloud secrets add-iam-policy-binding azure-devops-pat \
   --member="serviceAccount:889854265330-compute@developer.gserviceaccount.com" \
@@ -186,26 +189,85 @@ The Gemini prompt detects:
 
 ## Local Development
 
-To test locally with the Functions Framework:
+### Running Locally with Functions Framework
+
+The Cloud Functions Framework allows you to run and debug your function locally before deploying.
+
+#### 1. Install Dependencies
 
 ```bash
-# Install dependencies
 pip3 install -r requirements.txt
+```
 
-# Set environment variables (or use .env)
+#### 2. Set Environment Variables
+
+Option A: Use a `.env` file (recommended for development):
+
+```bash
+# Copy the example and fill in your values
+cp env.example .env
+# Edit .env with your actual credentials
+```
+
+Option B: Export directly in your shell:
+
+```bash
 export API_KEY="test-key"
 export GCS_BUCKET="your-bucket"
-# ... other vars
+export AZURE_DEVOPS_PAT="your-pat"
+export AZURE_DEVOPS_ORG="your-org"
+export AZURE_DEVOPS_PROJECT="your-project"
+export AZURE_DEVOPS_REPO="your-repo"
+export VERTEX_PROJECT="your-gcp-project"
+export VERTEX_LOCATION="us-central1"
+```
 
-# Run locally
-functions-framework --target=review_pr --port=8080
+#### 3. Start the Local Server
 
-# Test
+```bash
+# Run with Python module execution (most reliable)
+python3 -m functions_framework --target=review_pr --debug --port=8080
+
+# Or if functions-framework is in your PATH
+functions-framework --target=review_pr --debug --port=8080
+```
+
+The server will start on `http://localhost:8080` with:
+- ✅ Debug mode enabled (auto-reload on file changes)
+- ✅ Detailed logging
+- ✅ Flask debugger active
+
+#### 4. Test the Function
+
+```bash
 curl -X POST http://localhost:8080 \
   -H "Content-Type: application/json" \
   -H "X-API-Key: test-key" \
   -d '{"pr_id": 12345}'
 ```
+
+### Debugging with Cursor/VS Code
+
+A `.vscode/launch.json` configuration is included for debugging:
+
+1. Open **Run and Debug** panel (⌘+Shift+D / Ctrl+Shift+D)
+2. Select **"Debug Cloud Function (Local)"**
+3. Press **F5** to start debugging
+4. Set breakpoints in `main.py`
+5. Send a request with curl
+6. Debug interactively!
+
+The debugger configuration automatically:
+- Loads environment variables from `.env`
+- Attaches to the local server
+- Allows stepping through code and inspecting variables
+
+### Tips
+
+- **Auto-reload**: With `--debug`, the server restarts when you edit files
+- **Logging**: Check the console for detailed request/response logs
+- **Network access**: Use `http://0.0.0.0:8080` to test from other devices on your network
+- **Stop server**: Press `Ctrl+C` in the terminal
 
 ## Limitations
 
