@@ -19,12 +19,47 @@ Environment Variables:
 
 import os
 import json
+import logging
+import time
 import requests
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import functions_framework
 from google import genai
 from google.cloud import storage
+
+
+# =============================================================================
+# Timing Utilities for External Operations
+# =============================================================================
+
+@contextmanager
+def timed_operation():
+    """Context manager that tracks operation timing.
+    
+    Yields a callable that returns elapsed milliseconds since context entry.
+    Use for external API calls and storage operations only.
+    
+    Example:
+        with timed_operation() as elapsed:
+            response = requests.get(url)
+            logger.info(f"Request completed in {elapsed():.0f}ms")
+    """
+    start_time = time.time()
+    yield lambda: (time.time() - start_time) * 1000
+
+
+# =============================================================================
+# Logging Configuration
+# =============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -78,39 +113,54 @@ class AzureDevOpsClient:
         self.repo = repo
         self.auth = ("", pat)  # Basic auth with empty username
     
+    def _request(self, method: str, endpoint: str, data: dict = None, extra_params: dict = None) -> dict:
+        """Make HTTP request to Azure DevOps API with timing.
+        
+        Args:
+            method: HTTP method (GET, POST, PUT)
+            endpoint: API endpoint path
+            data: Request body for POST/PUT requests
+            extra_params: Additional query parameters (merged with api-version)
+            
+        Returns:
+            Response JSON as dict
+        """
+        url = f"{self.base_url}{endpoint}"
+        params = extra_params.copy() if extra_params else {}
+        params["api-version"] = self.API_VERSION
+        headers = {"Content-Type": "application/json"} if method in ("POST", "PUT") else None
+        
+        logger.info(f"[ADO {method}] {endpoint}")
+        if data:
+            logger.debug(f"[ADO {method}] Payload keys: {list(data.keys())}")
+        
+        start_time = time.time()
+        try:
+            response = requests.request(
+                method, url, auth=self.auth, params=params, headers=headers, json=data
+            )
+            elapsed = (time.time() - start_time) * 1000
+            
+            logger.info(f"[ADO {method}] {endpoint} | Status: {response.status_code} | {elapsed:.0f}ms")
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            elapsed = (time.time() - start_time) * 1000
+            logger.error(f"[ADO {method}] {endpoint} | FAILED | Status: {e.response.status_code} | {elapsed:.0f}ms")
+            logger.error(f"[ADO {method}] Error response: {e.response.text[:500]}")
+            raise
+    
     def _get(self, endpoint: str, params: dict = None) -> dict:
         """Make GET request to Azure DevOps API."""
-        url = f"{self.base_url}{endpoint}"
-        params = params or {}
-        params["api-version"] = self.API_VERSION
-        
-        response = requests.get(url, auth=self.auth, params=params)
-        response.raise_for_status()
-        return response.json()
+        return self._request("GET", endpoint, extra_params=params)
     
     def _post(self, endpoint: str, data: dict) -> dict:
         """Make POST request to Azure DevOps API."""
-        url = f"{self.base_url}{endpoint}"
-        params = {"api-version": self.API_VERSION}
-        headers = {"Content-Type": "application/json"}
-        
-        response = requests.post(
-            url, auth=self.auth, params=params, headers=headers, json=data
-        )
-        response.raise_for_status()
-        return response.json()
+        return self._request("POST", endpoint, data=data)
     
     def _put(self, endpoint: str, data: dict) -> dict:
         """Make PUT request to Azure DevOps API."""
-        url = f"{self.base_url}{endpoint}"
-        params = {"api-version": self.API_VERSION}
-        headers = {"Content-Type": "application/json"}
-        
-        response = requests.put(
-            url, auth=self.auth, params=params, headers=headers, json=data
-        )
-        response.raise_for_status()
-        return response.json()
+        return self._request("PUT", endpoint, data=data)
     
     def get_pull_request(self, pr_id: int) -> dict:
         """Fetch PR metadata."""
@@ -136,53 +186,69 @@ class AzureDevOpsClient:
     
     def get_file_content(self, path: str, commit_id: str) -> str:
         """Fetch file content at a specific commit."""
-        try:
-            url = f"{self.base_url}/git/repositories/{self.repo}/items"
-            params = {
-                "path": path,
-                "versionDescriptor.version": commit_id,
-                "versionDescriptor.versionType": "commit",
-                "api-version": self.API_VERSION,
-            }
-            response = requests.get(url, auth=self.auth, params=params)
-            response.raise_for_status()
-            return response.text
-        except requests.HTTPError:
-            return None  # File might not exist in this version
+        url = f"{self.base_url}/git/repositories/{self.repo}/items"
+        params = {
+            "path": path,
+            "versionDescriptor.version": commit_id,
+            "versionDescriptor.versionType": "commit",
+            "api-version": self.API_VERSION,
+        }
+        
+        logger.debug(f"[ADO FILE] Fetching: {path} @ {commit_id[:8]}")
+        
+        with timed_operation() as elapsed:
+            try:
+                response = requests.get(url, auth=self.auth, params=params)
+                response.raise_for_status()
+                logger.debug(f"[ADO FILE] {path} | {len(response.text)} bytes | {elapsed():.0f}ms")
+                return response.text
+            except requests.HTTPError as e:
+                logger.debug(f"[ADO FILE] {path} | Not found (status {e.response.status_code}) | {elapsed():.0f}ms")
+                return None  # File might not exist in this version
     
     def get_pr_diff(self, pr_id: int) -> list:
         """
         Get full diff for a PR with file contents from both source and target.
         Returns list of dicts with path, change_type, source_content, target_content.
         """
-        pr = self.get_pull_request(pr_id)
-        source_commit = pr["lastMergeSourceCommit"]["commitId"]
-        target_commit = pr["lastMergeTargetCommit"]["commitId"]
+        logger.info(f"[ADO] Fetching full diff for PR #{pr_id}")
         
-        changes = self.get_pr_changes(pr_id)
-        
-        file_diffs = []
-        for change in changes:
-            item = change.get("item", {})
-            path = item.get("path", "")
-            change_type = change.get("changeType", "unknown")
+        with timed_operation() as elapsed:
+            pr = self.get_pull_request(pr_id)
+            source_commit = pr["lastMergeSourceCommit"]["commitId"]
+            target_commit = pr["lastMergeTargetCommit"]["commitId"]
+            logger.info(f"[ADO] PR commits: source={source_commit[:8]} target={target_commit[:8]}")
             
-            # Skip folders
-            if item.get("isFolder"):
-                continue
+            changes = self.get_pr_changes(pr_id)
+            logger.info(f"[ADO] Found {len(changes)} changed items in PR")
             
-            # Get content from both versions
-            source_content = self.get_file_content(path, source_commit)
-            target_content = self.get_file_content(path, target_commit)
+            file_diffs = []
+            files_processed = 0
+            for change in changes:
+                item = change.get("item", {})
+                path = item.get("path", "")
+                change_type = change.get("changeType", "unknown")
+                
+                # Skip folders
+                if item.get("isFolder"):
+                    logger.debug(f"[ADO] Skipping folder: {path}")
+                    continue
+                
+                # Get content from both versions
+                source_content = self.get_file_content(path, source_commit)
+                target_content = self.get_file_content(path, target_commit)
+                
+                file_diffs.append({
+                    "path": path,
+                    "change_type": change_type,
+                    "source_content": source_content,  # New version (PR branch)
+                    "target_content": target_content,  # Old version (target branch)
+                })
+                files_processed += 1
             
-            file_diffs.append({
-                "path": path,
-                "change_type": change_type,
-                "source_content": source_content,  # New version (PR branch)
-                "target_content": target_content,  # Old version (target branch)
-            })
-        
-        return file_diffs
+            logger.info(f"[ADO] Diff complete: {files_processed} files | {elapsed():.0f}ms total")
+            
+            return file_diffs
     
     def post_pr_comment(self, pr_id: int, content: str) -> dict:
         """Post a comment thread on a PR.
@@ -233,11 +299,22 @@ class AzureDevOpsClient:
         url = f"https://dev.azure.com/{self.org}/_apis/connectionData"
         params = {"api-version": self.API_VERSION}
         
-        response = requests.get(url, auth=self.auth, params=params)
-        response.raise_for_status()
-        data = response.json()
+        logger.info("[ADO] Fetching current user identity")
         
-        return data["authenticatedUser"]["id"]
+        with timed_operation() as elapsed:
+            try:
+                response = requests.get(url, auth=self.auth, params=params)
+                response.raise_for_status()
+                data = response.json()
+                
+                user_id = data["authenticatedUser"]["id"]
+                user_name = data["authenticatedUser"].get("providerDisplayName", "unknown")
+                logger.info(f"[ADO] Current user: {user_name} (id={user_id[:8]}...) | {elapsed():.0f}ms")
+                
+                return user_id
+            except requests.HTTPError as e:
+                logger.error(f"[ADO] Failed to get user identity | Status: {e.response.status_code} | {elapsed():.0f}ms")
+                raise
 
 
 # =============================================================================
@@ -255,20 +332,31 @@ def save_to_storage(bucket_name: str, pr_id: int, review: str) -> str:
     Returns:
         Full GCS path (gs://bucket/path)
     """
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
+    logger.info(f"[GCS] Saving review for PR #{pr_id} to bucket: {bucket_name}")
+    logger.debug(f"[GCS] Review content size: {len(review)} chars")
     
-    # Date partitioning: yyyy/mm/dd
-    now = datetime.now(timezone.utc)
-    date_path = now.strftime("%Y/%m/%d")
-    timestamp = now.strftime("%H%M%S")
-    
-    blob_path = f"reviews/{date_path}/pr-{pr_id}-{timestamp}-review.md"
-    blob = bucket.blob(blob_path)
-    
-    blob.upload_from_string(review, content_type="text/markdown")
-    
-    return f"gs://{bucket_name}/{blob_path}"
+    with timed_operation() as elapsed:
+        try:
+            client = storage.Client()
+            bucket = client.bucket(bucket_name)
+            
+            # Date partitioning: yyyy/mm/dd
+            now = datetime.now(timezone.utc)
+            date_path = now.strftime("%Y/%m/%d")
+            timestamp = now.strftime("%H%M%S")
+            
+            blob_path = f"reviews/{date_path}/pr-{pr_id}-{timestamp}-review.md"
+            blob = bucket.blob(blob_path)
+            
+            blob.upload_from_string(review, content_type="text/markdown")
+            
+            full_path = f"gs://{bucket_name}/{blob_path}"
+            logger.info(f"[GCS] Upload complete: {blob_path} | {len(review)} bytes | {elapsed():.0f}ms")
+            
+            return full_path
+        except Exception as e:
+            logger.error(f"[GCS] Upload FAILED | {elapsed():.0f}ms | Error: {str(e)}")
+            raise
 
 
 # =============================================================================
@@ -438,25 +526,53 @@ def build_review_prompt(pr: dict, file_diffs: list) -> str:
 def call_gemini(config: dict, prompt: str) -> str:
     """Send prompt to Gemini via Vertex AI and return response."""
     
-    # Initialize the GenAI client for Vertex AI
-    client = genai.Client(
-        vertexai=True,
-        project=config["VERTEX_PROJECT"],
-        location=config["VERTEX_LOCATION"],
-    )
+    model_name = "gemini-2.5-pro"
+    project = config["VERTEX_PROJECT"]
+    location = config["VERTEX_LOCATION"]
     
-    # Generate content with system instruction
-    response = client.models.generate_content(
-        model="gemini-2.5-pro",
-        contents=prompt,
-        config={
-            "system_instruction": SYSTEM_PROMPT,
-            "max_output_tokens": 8192,
-            "temperature": 0.2,  # Lower for more focused analysis
-        },
-    )
+    logger.info(f"[GEMINI] Calling Vertex AI | Model: {model_name} | Project: {project} | Location: {location}")
+    logger.info(f"[GEMINI] Prompt size: {len(prompt)} chars | System prompt: {len(SYSTEM_PROMPT)} chars")
+    logger.debug(f"[GEMINI] Config: max_output_tokens=8192, temperature=0.2")
     
-    return response.text
+    with timed_operation() as elapsed:
+        try:
+            # Initialize the GenAI client for Vertex AI
+            client = genai.Client(
+                vertexai=True,
+                project=project,
+                location=location,
+            )
+            
+            logger.debug(f"[GEMINI] Client initialized in {elapsed():.0f}ms")
+            
+            # Generate content with system instruction
+            generate_start = time.time()
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config={
+                    "system_instruction": SYSTEM_PROMPT,
+                    "max_output_tokens": 8192,
+                    "temperature": 0.2,  # Lower for more focused analysis
+                },
+            )
+            
+            generate_time = (time.time() - generate_start) * 1000
+            response_size = len(response.text) if response.text else 0
+            
+            logger.info(f"[GEMINI] Response received | {response_size} chars | Generate: {generate_time:.0f}ms | Total: {elapsed():.0f}ms")
+            
+            # Log usage metadata if available
+            if hasattr(response, 'usage_metadata') and response.usage_metadata:
+                usage = response.usage_metadata
+                logger.info(f"[GEMINI] Tokens - Input: {getattr(usage, 'prompt_token_count', 'N/A')} | Output: {getattr(usage, 'candidates_token_count', 'N/A')}")
+            
+            return response.text
+            
+        except Exception as e:
+            logger.error(f"[GEMINI] API call FAILED | {elapsed():.0f}ms | Error type: {type(e).__name__}")
+            logger.error(f"[GEMINI] Error details: {str(e)}")
+            raise
 
 
 # =============================================================================
@@ -479,113 +595,155 @@ def review_pr(request):
     Response:
         JSON with review results and actions taken
     """
-    # Load config
-    config, missing = load_config()
-    if missing:
-        return make_response(
-            {"error": f"Missing config: {', '.join(missing)}"}, 500
+    with timed_operation() as elapsed:
+        logger.info("=" * 60)
+        logger.info("[REQUEST] PR Review function invoked")
+        logger.info(f"[REQUEST] Method: {request.method} | Path: {request.path}")
+        
+        # Load config
+        config, missing = load_config()
+        if missing:
+            logger.error(f"[CONFIG] Missing required environment variables: {missing}")
+            return make_response(
+                {"error": f"Missing config: {', '.join(missing)}"}, 500
+            )
+        logger.info("[CONFIG] All required environment variables loaded")
+        
+        # Validate API key
+        api_key = request.headers.get("X-API-Key")
+        if not api_key or api_key != config["API_KEY"]:
+            logger.warning("[AUTH] Invalid or missing API key")
+            return make_response({"error": "Invalid or missing API key"}, 401)
+        logger.info("[AUTH] API key validated")
+        
+        # Parse request
+        try:
+            request_json = request.get_json(silent=True)
+            if not request_json:
+                logger.warning("[REQUEST] Empty or invalid JSON body")
+                return make_response({"error": "Request body must be JSON"}, 400)
+            
+            pr_id = request_json.get("pr_id")
+            if not pr_id:
+                logger.warning("[REQUEST] Missing pr_id in request body")
+                return make_response({"error": "Missing required field: pr_id"}, 400)
+            
+            pr_id = int(pr_id)
+            logger.info(f"[REQUEST] Processing PR #{pr_id}")
+        except (ValueError, TypeError) as e:
+            logger.error(f"[REQUEST] Invalid pr_id format: {e}")
+            return make_response({"error": f"Invalid pr_id: {e}"}, 400)
+        
+        # Initialize Azure DevOps client
+        logger.info(f"[ADO] Initializing client | Org: {config['AZURE_DEVOPS_ORG']} | Project: {config['AZURE_DEVOPS_PROJECT']} | Repo: {config['AZURE_DEVOPS_REPO']}")
+        ado = AzureDevOpsClient(
+            org=config["AZURE_DEVOPS_ORG"],
+            project=config["AZURE_DEVOPS_PROJECT"],
+            repo=config["AZURE_DEVOPS_REPO"],
+            pat=config["AZURE_DEVOPS_PAT"],
         )
-    
-    # Validate API key
-    api_key = request.headers.get("X-API-Key")
-    if not api_key or api_key != config["API_KEY"]:
-        return make_response({"error": "Invalid or missing API key"}, 401)
-    
-    # Parse request
-    try:
-        request_json = request.get_json(silent=True)
-        if not request_json:
-            return make_response({"error": "Request body must be JSON"}, 400)
         
-        pr_id = request_json.get("pr_id")
-        if not pr_id:
-            return make_response({"error": "Missing required field: pr_id"}, 400)
-        
-        pr_id = int(pr_id)
-    except (ValueError, TypeError) as e:
-        return make_response({"error": f"Invalid pr_id: {e}"}, 400)
-    
-    # Initialize Azure DevOps client
-    ado = AzureDevOpsClient(
-        org=config["AZURE_DEVOPS_ORG"],
-        project=config["AZURE_DEVOPS_PROJECT"],
-        repo=config["AZURE_DEVOPS_REPO"],
-        pat=config["AZURE_DEVOPS_PAT"],
-    )
-    
-    try:
-        # Fetch PR data
-        pr = ado.get_pull_request(pr_id)
-        pr_title = pr.get("title", "Untitled")
-        
-        # Fetch file diffs
-        file_diffs = ado.get_pr_diff(pr_id)
-        
-        if not file_diffs:
+        try:
+            # Fetch PR data
+            logger.info(f"[FLOW] Step 1/5: Fetching PR metadata")
+            pr = ado.get_pull_request(pr_id)
+            pr_title = pr.get("title", "Untitled")
+            pr_author = pr.get("createdBy", {}).get("displayName", "Unknown")
+            logger.info(f"[FLOW] PR: '{pr_title}' by {pr_author}")
+            
+            # Fetch file diffs
+            logger.info(f"[FLOW] Step 2/5: Fetching file diffs")
+            file_diffs = ado.get_pr_diff(pr_id)
+            
+            if not file_diffs:
+                logger.info(f"[FLOW] No file changes found | Total time: {elapsed():.0f}ms")
+                return make_response({
+                    "pr_id": pr_id,
+                    "title": pr_title,
+                    "message": "No file changes found in this PR",
+                    "has_blocking": False,
+                    "has_warning": False,
+                    "action_taken": None,
+                    "commented": False,
+                    "storage_path": None,
+                })
+            
+            logger.info(f"[FLOW] Found {len(file_diffs)} files to review")
+            for diff in file_diffs:
+                logger.debug(f"[FLOW]   - {diff['path']} ({diff['change_type']})")
+            
+            # Build prompt and call Gemini
+            logger.info(f"[FLOW] Step 3/5: Building prompt and calling Gemini")
+            prompt = build_review_prompt(pr, file_diffs)
+            logger.info(f"[FLOW] Prompt built: {len(prompt)} chars")
+            
+            review = call_gemini(config, prompt)
+            
+            # Determine severity
+            logger.info(f"[FLOW] Step 4/5: Analyzing severity")
+            max_severity = get_max_severity(review)
+            has_blocking = max_severity == "blocking"
+            has_warning = max_severity == "warning"
+            logger.info(f"[FLOW] Severity assessment: {max_severity.upper()} | blocking={has_blocking} | warning={has_warning}")
+            
+            # Save to Cloud Storage
+            logger.info(f"[FLOW] Step 5/5: Saving to Cloud Storage")
+            storage_path = save_to_storage(config["GCS_BUCKET"], pr_id, review)
+            
+            # Take action based on severity
+            commented = False
+            action_taken = None
+            
+            if has_blocking or has_warning:
+                logger.info(f"[ACTION] Posting review comment to PR #{pr_id}")
+                # Post comment with full review
+                comment_header = "##  Automated Regression Review\n\n"
+                if has_blocking:
+                    comment_header += "⛔ **Sorry Dave, I can't merge you this time. This PR has been automatically rejected due to blocking issues.**\n\n"
+                else:
+                    comment_header += "⚠️ **Warning: This PR has potential issues that should be reviewed.**\n\n"
+                
+                comment_header += f"📁 Full review saved to: `{storage_path}`\n\n---\n\n"
+                
+                ado.post_pr_comment(pr_id, comment_header + review)
+                commented = True
+                logger.info(f"[ACTION] Comment posted successfully")
+                
+                if has_blocking:
+                    # Reject the PR
+                    logger.info(f"[ACTION] Rejecting PR due to blocking issues")
+                    user_id = ado.get_current_user_id()
+                    ado.reject_pr(pr_id, user_id)
+                    action_taken = "rejected"
+                    logger.info(f"[ACTION] PR #{pr_id} rejected")
+                else:
+                    action_taken = "commented"
+            else:
+                logger.info(f"[ACTION] No issues found - no action taken on PR")
+            
+            logger.info(f"[COMPLETE] PR #{pr_id} review finished | Severity: {max_severity} | Action: {action_taken or 'none'} | Total time: {elapsed():.0f}ms")
+            logger.info("=" * 60)
+            
             return make_response({
                 "pr_id": pr_id,
                 "title": pr_title,
-                "message": "No file changes found in this PR",
-                "has_blocking": False,
-                "has_warning": False,
-                "action_taken": None,
-                "commented": False,
-                "storage_path": None,
+                "files_changed": len(file_diffs),
+                "max_severity": max_severity,
+                "has_blocking": has_blocking,
+                "has_warning": has_warning,
+                "action_taken": action_taken,
+                "commented": commented,
+                "storage_path": storage_path,
+                "review_preview": review[:500] + "..." if len(review) > 500 else review,
             })
-        
-        # Build prompt and call Gemini
-        prompt = build_review_prompt(pr, file_diffs)
-        review = call_gemini(config, prompt)
-        
-        # Determine severity
-        max_severity = get_max_severity(review)
-        has_blocking = max_severity == "blocking"
-        has_warning = max_severity == "warning"
-        
-        # Save to Cloud Storage
-        storage_path = save_to_storage(config["GCS_BUCKET"], pr_id, review)
-        
-        # Take action based on severity
-        commented = False
-        action_taken = None
-        
-        if has_blocking or has_warning:
-            # Post comment with full review
-            comment_header = "## 🤖 Automated Regression Review\n\n"
-            if has_blocking:
-                comment_header += "⛔ **This PR has been automatically rejected due to blocking issues.**\n\n"
-            else:
-                comment_header += "⚠️ **Warning: This PR has potential issues that should be reviewed.**\n\n"
             
-            comment_header += f"📁 Full review saved to: `{storage_path}`\n\n---\n\n"
-            
-            ado.post_pr_comment(pr_id, comment_header + review)
-            commented = True
-            
-            if has_blocking:
-                # Reject the PR
-                user_id = ado.get_current_user_id()
-                ado.reject_pr(pr_id, user_id)
-                action_taken = "rejected"
-            else:
-                action_taken = "commented"
-        
-        return make_response({
-            "pr_id": pr_id,
-            "title": pr_title,
-            "files_changed": len(file_diffs),
-            "max_severity": max_severity,
-            "has_blocking": has_blocking,
-            "has_warning": has_warning,
-            "action_taken": action_taken,
-            "commented": commented,
-            "storage_path": storage_path,
-            "review_preview": review[:500] + "..." if len(review) > 500 else review,
-        })
-        
-    except requests.HTTPError as e:
-        return make_response({
-            "error": f"Azure DevOps API error: {e.response.status_code} - {e.response.text}"
-        }, 502)
-    except Exception as e:
-        return make_response({"error": f"Internal error: {str(e)}"}, 500)
+        except requests.HTTPError as e:
+            logger.error(f"[ERROR] Azure DevOps API error | Status: {e.response.status_code} | {elapsed():.0f}ms")
+            logger.error(f"[ERROR] Response body: {e.response.text[:500]}")
+            return make_response({
+                "error": f"Azure DevOps API error: {e.response.status_code} - {e.response.text}"
+            }, 502)
+        except Exception as e:
+            logger.error(f"[ERROR] Internal error | Type: {type(e).__name__} | {elapsed():.0f}ms")
+            logger.error(f"[ERROR] Details: {str(e)}", exc_info=True)
+            return make_response({"error": f"Internal error: {str(e)}"}, 500)
