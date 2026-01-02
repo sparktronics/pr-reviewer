@@ -6,11 +6,16 @@ Run with: pytest test_main.py -v
 import pytest
 from unittest.mock import MagicMock, patch
 
+from google.api_core.exceptions import PreconditionFailed
+
 from main import (
     AzureDevOpsClient,
     save_to_storage,
     get_max_severity,
     build_review_prompt,
+    check_and_claim_processing,
+    update_marker_completed,
+    delete_marker,
 )
 
 
@@ -309,4 +314,221 @@ class TestBuildReviewPrompt:
         prompt = build_review_prompt(sample_pr, sample_file_diffs)
         
         assert prompt.strip().endswith("Please provide your regression-focused review.")
+
+
+# =============================================================================
+# Idempotency Tests
+# =============================================================================
+
+class TestCheckAndClaimProcessing:
+    """Tests for check_and_claim_processing function."""
+
+    def test_claim_success_when_marker_not_exists(self, mocker):
+        """Returns True and creates marker when no existing marker."""
+        mock_blob = MagicMock()
+        mock_blob.exists.return_value = False
+        
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+        
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        
+        mocker.patch("main.storage.Client", return_value=mock_client)
+        
+        result = check_and_claim_processing("test-bucket", 12345, "abc123def456")
+        
+        assert result is True
+        mock_bucket.blob.assert_called_once_with("idempotency/pr-12345-abc123def456.json")
+        mock_blob.upload_from_string.assert_called_once()
+        
+        # Verify atomic write was used
+        call_kwargs = mock_blob.upload_from_string.call_args[1]
+        assert call_kwargs["if_generation_match"] == 0
+        assert call_kwargs["content_type"] == "application/json"
+
+    def test_skip_when_marker_exists(self, mocker):
+        """Returns False when marker already exists."""
+        mock_blob = MagicMock()
+        mock_blob.exists.return_value = True
+        
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+        
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        
+        mocker.patch("main.storage.Client", return_value=mock_client)
+        
+        result = check_and_claim_processing("test-bucket", 12345, "abc123def456")
+        
+        assert result is False
+        mock_blob.upload_from_string.assert_not_called()
+
+    def test_skip_on_race_condition(self, mocker):
+        """Returns False when another instance claimed marker (PreconditionFailed)."""
+        mock_blob = MagicMock()
+        mock_blob.exists.return_value = False
+        mock_blob.upload_from_string.side_effect = PreconditionFailed("Precondition failed")
+        
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+        
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        
+        mocker.patch("main.storage.Client", return_value=mock_client)
+        
+        result = check_and_claim_processing("test-bucket", 12345, "abc123def456")
+        
+        assert result is False
+
+    def test_marker_content_format(self, mocker):
+        """Marker JSON contains expected fields."""
+        import json
+        
+        mock_blob = MagicMock()
+        mock_blob.exists.return_value = False
+        
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+        
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        
+        mocker.patch("main.storage.Client", return_value=mock_client)
+        
+        check_and_claim_processing("test-bucket", 12345, "abc123def456")
+        
+        # Get the JSON content that was uploaded
+        uploaded_content = mock_blob.upload_from_string.call_args[0][0]
+        marker = json.loads(uploaded_content)
+        
+        assert marker["pr_id"] == 12345
+        assert marker["commit_sha"] == "abc123def456"
+        assert marker["status"] == "processing"
+        assert "claimed_at" in marker
+
+
+class TestUpdateMarkerCompleted:
+    """Tests for update_marker_completed function."""
+
+    def test_update_marker_success(self, mocker):
+        """Updates marker with completion status."""
+        import json
+        
+        mock_blob = MagicMock()
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+        
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        
+        mocker.patch("main.storage.Client", return_value=mock_client)
+        
+        update_marker_completed("test-bucket", 12345, "abc123def456", "warning", True)
+        
+        mock_bucket.blob.assert_called_once_with("idempotency/pr-12345-abc123def456.json")
+        mock_blob.upload_from_string.assert_called_once()
+        
+        # Verify marker content
+        uploaded_content = mock_blob.upload_from_string.call_args[0][0]
+        marker = json.loads(uploaded_content)
+        
+        assert marker["pr_id"] == 12345
+        assert marker["commit_sha"] == "abc123def456"
+        assert marker["status"] == "completed"
+        assert marker["max_severity"] == "warning"
+        assert marker["commented"] is True
+        assert "processed_at" in marker
+
+
+class TestDeleteMarker:
+    """Tests for delete_marker function."""
+
+    def test_delete_marker_success(self, mocker):
+        """Deletes marker blob successfully."""
+        mock_blob = MagicMock()
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+        
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        
+        mocker.patch("main.storage.Client", return_value=mock_client)
+        
+        delete_marker("test-bucket", 12345, "abc123def456")
+        
+        mock_bucket.blob.assert_called_once_with("idempotency/pr-12345-abc123def456.json")
+        mock_blob.delete.assert_called_once()
+
+    def test_delete_marker_handles_error(self, mocker):
+        """Handles deletion errors gracefully (doesn't raise)."""
+        mock_blob = MagicMock()
+        mock_blob.delete.side_effect = Exception("Blob not found")
+        
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+        
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        
+        mocker.patch("main.storage.Client", return_value=mock_client)
+        
+        # Should not raise
+        delete_marker("test-bucket", 12345, "abc123def456")
+
+
+class TestIdempotencyKeyFormat:
+    """Tests verifying the idempotency key format."""
+
+    def test_different_commits_same_pr_have_different_keys(self, mocker):
+        """Same PR with different commits creates different marker paths."""
+        mock_blob = MagicMock()
+        mock_blob.exists.return_value = False
+        
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+        
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        
+        mocker.patch("main.storage.Client", return_value=mock_client)
+        
+        # First commit
+        check_and_claim_processing("test-bucket", 12345, "commit_a")
+        first_call_path = mock_bucket.blob.call_args_list[0][0][0]
+        
+        # Second commit (same PR)
+        check_and_claim_processing("test-bucket", 12345, "commit_b")
+        second_call_path = mock_bucket.blob.call_args_list[1][0][0]
+        
+        assert first_call_path != second_call_path
+        assert "pr-12345-commit_a" in first_call_path
+        assert "pr-12345-commit_b" in second_call_path
+
+    def test_same_commit_different_prs_have_different_keys(self, mocker):
+        """Same commit on different PRs creates different marker paths."""
+        mock_blob = MagicMock()
+        mock_blob.exists.return_value = False
+        
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+        
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        
+        mocker.patch("main.storage.Client", return_value=mock_client)
+        
+        # First PR
+        check_and_claim_processing("test-bucket", 11111, "same_commit")
+        first_call_path = mock_bucket.blob.call_args_list[0][0][0]
+        
+        # Second PR (same commit SHA - edge case)
+        check_and_claim_processing("test-bucket", 22222, "same_commit")
+        second_call_path = mock_bucket.blob.call_args_list[1][0][0]
+        
+        assert first_call_path != second_call_path
+        assert "pr-11111" in first_call_path
+        assert "pr-22222" in second_call_path
 
