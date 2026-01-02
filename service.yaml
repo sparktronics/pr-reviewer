@@ -1,0 +1,89 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  annotations:
+    cloudfunctions.googleapis.com/function-id: pr-regression-review
+    run.googleapis.com/build-base-image: us-central1-docker.pkg.dev/serverless-runtimes/google-22-full/runtimes/python312
+    run.googleapis.com/build-enable-automatic-updates: 'true'
+    run.googleapis.com/build-function-target: review_pr
+    run.googleapis.com/build-image-uri: us-central1-docker.pkg.dev/rawl-extractor/gcf-artifacts/rawl--extractor__us--central1__pr--regression--review:version_1
+    run.googleapis.com/build-name: projects/889854265330/locations/us-central1/builds/df4af18b-b579-4896-8372-3a33d6ccc899
+    run.googleapis.com/build-service-account: projects/rawl-extractor/serviceAccounts/889854265330-compute@developer.gserviceaccount.com
+    run.googleapis.com/build-source-location: gs://gcf-v2-sources-889854265330-us-central1/pr-regression-review/function-source.zip#1767307597258335
+    run.googleapis.com/custom-audiences: '["https://us-central1-rawl-extractor.cloudfunctions.net/pr-regression-review"]'
+    run.googleapis.com/ingress: all
+    run.googleapis.com/ingress-status: all
+    run.googleapis.com/maxScale: '60'
+    run.googleapis.com/urls: '["https://pr-regression-review-889854265330.us-central1.run.app","https://us-central1-rawl-extractor.cloudfunctions.net/pr-regression-review","https://pr-regression-review-ufds3754tq-uc.a.run.app"]'
+  labels:
+    cloud.googleapis.com/location: us-central1
+    goog-cloudfunctions-runtime: python312
+    goog-drz-cloudfunctions-id: pr-regression-review
+    goog-drz-cloudfunctions-location: us-central1
+    goog-managed-by: cloudfunctions
+  name: pr-regression-review
+  namespace: '889854265330'
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: '60'
+        cloudfunctions.googleapis.com/trigger-type: HTTP_TRIGGER
+        run.googleapis.com/base-images: '{"worker":"us-central1-docker.pkg.dev/serverless-runtimes/google-22-full/runtimes/python312"}'
+        run.googleapis.com/client-name: gcloud
+        run.googleapis.com/secrets: secret-5bfd1bad-bf8a-3298-8fa1-5d01d034eb24:projects/889854265330/secrets/azure-devops-pat,secret-99c0feb3-1400-3e09-af7d-db16c352c1f1:projects/889854265330/secrets/pr-review-api-key
+        run.googleapis.com/startup-cpu-boost: 'true'
+      labels:
+        goog-drz-cloudfunctions-id: pr-regression-review
+        goog-drz-cloudfunctions-location: us-central1
+        run.googleapis.com/startupProbeType: Default
+      name: pr-regression-review-00002-yac
+    spec:
+      containerConcurrency: 1
+      containers:
+      - env:
+        - name: AZURE_DEVOPS_ORG
+          value: batdigital
+        - name: AZURE_DEVOPS_PROJECT
+          value: Consumer%20Platforms
+        - name: AZURE_DEVOPS_REPO
+          value: AEM-Platform-Core
+        - name: GCS_BUCKET
+          value: rawl9001
+        - name: VERTEX_LOCATION
+          value: us-central1
+        - name: VERTEX_PROJECT
+          value: rawl-extractor
+        - name: LOG_EXECUTION_ID
+          value: 'true'
+        - name: API_KEY
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: secret-99c0feb3-1400-3e09-af7d-db16c352c1f1
+        - name: AZURE_DEVOPS_PAT
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: secret-5bfd1bad-bf8a-3298-8fa1-5d01d034eb24
+        image: us-central1-docker.pkg.dev/rawl-extractor/gcf-artifacts/rawl--extractor__us--central1__pr--regression--review:version_1
+        name: worker
+        ports:
+        - containerPort: 8080
+          name: http1
+        resources:
+          limits:
+            cpu: '0.3333'
+            memory: 512M
+        startupProbe:
+          failureThreshold: 1
+          periodSeconds: 240
+          tcpSocket:
+            port: 8080
+          timeoutSeconds: 240
+      runtimeClassName: run.googleapis.com/linux-base-image-update
+      serviceAccountName: 889854265330-compute@developer.gserviceaccount.com
+      timeoutSeconds: 300
+  traffic:
+  - latestRevision: true
+    percent: 100
