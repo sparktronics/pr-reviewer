@@ -1,0 +1,7 @@
+requests>=2.31.0
+# Using the new Google GenAI SDK (replaces deprecated google-cloud-aiplatform)
+google-genai>=1.37.0
+# Cloud Functions framework for HTTP entry point
+functions-framework>=3.0.0
+# Cloud Storage for saving reviews
+google-cloud-storage>=2.0.0
