@@ -15,6 +15,12 @@ Environment Variables:
     AZURE_DEVOPS_REPO     - Repository name (or ID)
     VERTEX_PROJECT        - GCP Project ID
     VERTEX_LOCATION       - GCP Region (default: us-central1)
+    PUBSUB_TOPIC          - Pub/Sub topic for webhook messages (default: pr-review-trigger)
+
+Entry Points:
+    review_pr          - HTTP endpoint for synchronous PR review
+    review_pr_pubsub   - Pub/Sub triggered async PR review (with idempotency)
+    receive_webhook    - HTTP webhook receiver that publishes to Pub/Sub
 """
 
 import os
@@ -31,6 +37,7 @@ import functions_framework
 from cloudevents.http import CloudEvent
 from google import genai
 from google.cloud import storage
+from google.cloud import pubsub_v1
 from google.api_core.exceptions import PreconditionFailed
 
 
@@ -875,11 +882,16 @@ def review_pr_pubsub(cloud_event: CloudEvent) -> None:
     Pub/Sub delivers the same message multiple times (at-least-once delivery).
     
     Pub/Sub Message Format:
-        {"pr_id": 12345}
+        {
+            "pr_id": 12345,
+            "commit_sha": "abc123def...",  // Optional: provided by webhook receiver
+            "received_at": "2026-01-03T10:30:00Z",
+            "source": "azure-devops-pipeline"
+        }
         
     The function will:
-    1. Parse the PR ID from the Pub/Sub message
-    2. Fetch PR metadata to get the latest commit SHA
+    1. Parse the PR ID and optional commit_sha from the Pub/Sub message
+    2. Fetch PR metadata (use commit_sha from message if provided)
     3. Check idempotency marker (skip if already processed)
     4. Process the PR review
     5. Update the marker on completion
@@ -912,7 +924,13 @@ def review_pr_pubsub(cloud_event: CloudEvent) -> None:
                 return
             
             pr_id = int(pr_id)
-            logger.info(f"[PUBSUB] Processing PR #{pr_id}")
+            
+            # Extract commit_sha from message (provided by webhook receiver)
+            message_commit_sha = message.get("commit_sha")
+            if message_commit_sha:
+                logger.info(f"[PUBSUB] Processing PR #{pr_id} @ {message_commit_sha[:8]} (from message)")
+            else:
+                logger.info(f"[PUBSUB] Processing PR #{pr_id} (commit_sha will be fetched from ADO)")
             
         except (ValueError, TypeError, json.JSONDecodeError) as e:
             logger.error(f"[PUBSUB] Failed to parse message: {e}")
@@ -930,12 +948,20 @@ def review_pr_pubsub(cloud_event: CloudEvent) -> None:
         commit_sha = None
         
         try:
-            # Fetch PR metadata to get commit SHA for idempotency
-            logger.info(f"[FLOW] Step 1/6: Fetching PR metadata for idempotency check")
+            # Fetch PR metadata
+            logger.info(f"[FLOW] Step 1/6: Fetching PR metadata")
             pr = ado.get_pull_request(pr_id)
             pr_title = pr.get("title", "Untitled")
             pr_author = pr.get("createdBy", {}).get("displayName", "Unknown")
-            commit_sha = pr["lastMergeSourceCommit"]["commitId"]
+            
+            # Use commit_sha from message if provided, otherwise fetch from PR metadata
+            if message_commit_sha:
+                commit_sha = message_commit_sha
+                logger.info(f"[FLOW] Using commit_sha from message: {commit_sha[:8]}")
+            else:
+                commit_sha = pr["lastMergeSourceCommit"]["commitId"]
+                logger.info(f"[FLOW] Fetched commit_sha from ADO: {commit_sha[:8]}")
+            
             logger.info(f"[FLOW] PR: '{pr_title}' by {pr_author} @ commit {commit_sha[:8]}")
             
             # Idempotency check
@@ -1020,3 +1046,150 @@ def review_pr_pubsub(cloud_event: CloudEvent) -> None:
             if commit_sha:
                 delete_marker(config["GCS_BUCKET"], pr_id, commit_sha)
             raise  # Re-raise to trigger Pub/Sub retry
+
+
+# =============================================================================
+# Webhook Receiver Cloud Function Entry Point
+# =============================================================================
+
+def load_webhook_config() -> tuple[dict, list]:
+    """Load minimal configuration for webhook receiver.
+    
+    Returns:
+        tuple: (config dict, list of missing required vars)
+    """
+    required = ["API_KEY", "VERTEX_PROJECT"]
+    
+    config = {}
+    missing = []
+    
+    for var in required:
+        value = os.environ.get(var)
+        if not value:
+            missing.append(var)
+        config[var] = value
+    
+    # Optional with default
+    config["PUBSUB_TOPIC"] = os.environ.get("PUBSUB_TOPIC", "pr-review-trigger")
+    
+    return config, missing
+
+
+@functions_framework.http
+def receive_webhook(request):
+    """
+    HTTP webhook receiver for Azure DevOps pipeline.
+    
+    Validates the request and publishes a message to Pub/Sub for async processing.
+    This decouples the webhook acknowledgment from the actual PR review processing.
+    
+    Request Format:
+        POST /
+        Content-Type: application/json
+        X-API-Key: <api-key>
+        
+        {
+            "pr_id": 357462,
+            "commit_sha": "abc123def456789..."
+        }
+    
+    Response (202 Accepted):
+        {
+            "status": "queued",
+            "message_id": "1234567890",
+            "pr_id": 357462,
+            "commit_sha": "abc123de"
+        }
+    """
+    with timed_operation() as elapsed:
+        logger.info("=" * 60)
+        logger.info("[WEBHOOK] PR Review webhook received")
+        
+        # Load minimal config (only need API_KEY and PUBSUB_TOPIC)
+        config, missing = load_webhook_config()
+        if missing:
+            logger.error(f"[CONFIG] Missing required environment variables: {missing}")
+            return {"error": f"Server configuration error: missing {missing}"}, 500
+        
+        # Validate API key
+        api_key = request.headers.get("X-API-Key")
+        if not api_key:
+            logger.warning("[AUTH] Missing X-API-Key header")
+            return {"error": "Missing X-API-Key header"}, 401
+        
+        if api_key != config["API_KEY"]:
+            logger.warning("[AUTH] Invalid API key")
+            return {"error": "Invalid API key"}, 401
+        
+        logger.info("[AUTH] API key validated")
+        
+        # Parse JSON body
+        try:
+            data = request.get_json(force=True)
+        except Exception as e:
+            logger.error(f"[PARSE] Invalid JSON body: {e}")
+            return {"error": "Invalid JSON body"}, 400
+        
+        if not data:
+            logger.error("[PARSE] Empty request body")
+            return {"error": "Empty request body"}, 400
+        
+        # Validate required fields
+        pr_id = data.get("pr_id")
+        commit_sha = data.get("commit_sha")
+        
+        if not pr_id:
+            logger.error("[PARSE] Missing pr_id in request")
+            return {"error": "Missing required field: pr_id"}, 400
+        
+        if not commit_sha:
+            logger.error("[PARSE] Missing commit_sha in request")
+            return {"error": "Missing required field: commit_sha"}, 400
+        
+        # Validate types
+        try:
+            pr_id = int(pr_id)
+        except (ValueError, TypeError):
+            logger.error(f"[PARSE] Invalid pr_id: {pr_id}")
+            return {"error": "pr_id must be an integer"}, 400
+        
+        if not isinstance(commit_sha, str) or len(commit_sha) < 7:
+            logger.error(f"[PARSE] Invalid commit_sha: {commit_sha}")
+            return {"error": "commit_sha must be a string of at least 7 characters"}, 400
+        
+        logger.info(f"[WEBHOOK] PR #{pr_id} @ {commit_sha[:8]}")
+        
+        # Build Pub/Sub message
+        message = {
+            "pr_id": pr_id,
+            "commit_sha": commit_sha,
+            "received_at": datetime.now(timezone.utc).isoformat(),
+            "source": "azure-devops-pipeline"
+        }
+        
+        # Publish to Pub/Sub
+        try:
+            publisher = pubsub_v1.PublisherClient()
+            topic_path = publisher.topic_path(config["VERTEX_PROJECT"], config["PUBSUB_TOPIC"])
+            
+            message_bytes = json.dumps(message).encode("utf-8")
+            
+            with timed_operation() as pubsub_elapsed:
+                future = publisher.publish(topic_path, message_bytes)
+                message_id = future.result(timeout=30)
+            
+            logger.info(f"[PUBSUB] Published message {message_id} to {config['PUBSUB_TOPIC']} | {pubsub_elapsed():.0f}ms")
+            
+        except Exception as e:
+            logger.error(f"[PUBSUB] Failed to publish message: {e}")
+            return {"error": f"Failed to queue message: {str(e)}"}, 500
+        
+        logger.info(f"[COMPLETE] Webhook processed | PR #{pr_id} queued | {elapsed():.0f}ms")
+        logger.info("=" * 60)
+        
+        return {
+            "status": "queued",
+            "message_id": message_id,
+            "pr_id": pr_id,
+            "commit_sha": commit_sha[:8]
+        }, 202

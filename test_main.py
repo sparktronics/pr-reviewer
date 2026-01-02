@@ -16,6 +16,8 @@ from main import (
     check_and_claim_processing,
     update_marker_completed,
     delete_marker,
+    load_webhook_config,
+    receive_webhook,
 )
 
 
@@ -531,4 +533,297 @@ class TestIdempotencyKeyFormat:
         assert first_call_path != second_call_path
         assert "pr-11111" in first_call_path
         assert "pr-22222" in second_call_path
+
+
+# =============================================================================
+# Webhook Receiver Tests
+# =============================================================================
+
+class TestLoadWebhookConfig:
+    """Tests for load_webhook_config function."""
+
+    def test_load_webhook_config_success(self, mocker):
+        """Returns config dict when all required vars present."""
+        mocker.patch.dict("os.environ", {
+            "API_KEY": "test-api-key",
+            "VERTEX_PROJECT": "test-project",
+        })
+        
+        config, missing = load_webhook_config()
+        
+        assert missing == []
+        assert config["API_KEY"] == "test-api-key"
+        assert config["VERTEX_PROJECT"] == "test-project"
+        assert config["PUBSUB_TOPIC"] == "pr-review-trigger"  # default
+
+    def test_load_webhook_config_custom_topic(self, mocker):
+        """Uses custom PUBSUB_TOPIC when provided."""
+        mocker.patch.dict("os.environ", {
+            "API_KEY": "test-api-key",
+            "VERTEX_PROJECT": "test-project",
+            "PUBSUB_TOPIC": "custom-topic",
+        })
+        
+        config, missing = load_webhook_config()
+        
+        assert config["PUBSUB_TOPIC"] == "custom-topic"
+
+    def test_load_webhook_config_missing_vars(self, mocker):
+        """Returns missing vars list when required vars missing."""
+        mocker.patch.dict("os.environ", {}, clear=True)
+        
+        config, missing = load_webhook_config()
+        
+        assert "API_KEY" in missing
+        assert "VERTEX_PROJECT" in missing
+
+
+class TestReceiveWebhook:
+    """Tests for receive_webhook function."""
+
+    @pytest.fixture
+    def mock_request(self, mocker):
+        """Create a mock Flask request object."""
+        request = MagicMock()
+        request.headers = {}
+        request.get_json = MagicMock(return_value={})
+        return request
+
+    def test_missing_api_key_header(self, mock_request, mocker):
+        """Returns 401 when X-API-Key header is missing."""
+        mocker.patch.dict("os.environ", {
+            "API_KEY": "test-api-key",
+            "VERTEX_PROJECT": "test-project",
+        })
+        mock_request.headers = {}
+        
+        response, status = receive_webhook(mock_request)
+        
+        assert status == 401
+        assert "Missing X-API-Key" in response["error"]
+
+    def test_invalid_api_key(self, mock_request, mocker):
+        """Returns 401 when API key doesn't match."""
+        mocker.patch.dict("os.environ", {
+            "API_KEY": "correct-key",
+            "VERTEX_PROJECT": "test-project",
+        })
+        mock_request.headers = {"X-API-Key": "wrong-key"}
+        
+        response, status = receive_webhook(mock_request)
+        
+        assert status == 401
+        assert "Invalid API key" in response["error"]
+
+    def test_missing_pr_id(self, mock_request, mocker):
+        """Returns 400 when pr_id is missing."""
+        mocker.patch.dict("os.environ", {
+            "API_KEY": "test-key",
+            "VERTEX_PROJECT": "test-project",
+        })
+        mock_request.headers = {"X-API-Key": "test-key"}
+        mock_request.get_json.return_value = {"commit_sha": "abc123def"}
+        
+        response, status = receive_webhook(mock_request)
+        
+        assert status == 400
+        assert "pr_id" in response["error"]
+
+    def test_missing_commit_sha(self, mock_request, mocker):
+        """Returns 400 when commit_sha is missing."""
+        mocker.patch.dict("os.environ", {
+            "API_KEY": "test-key",
+            "VERTEX_PROJECT": "test-project",
+        })
+        mock_request.headers = {"X-API-Key": "test-key"}
+        mock_request.get_json.return_value = {"pr_id": 12345}
+        
+        response, status = receive_webhook(mock_request)
+        
+        assert status == 400
+        assert "commit_sha" in response["error"]
+
+    def test_invalid_pr_id_type(self, mock_request, mocker):
+        """Returns 400 when pr_id is not a valid integer."""
+        mocker.patch.dict("os.environ", {
+            "API_KEY": "test-key",
+            "VERTEX_PROJECT": "test-project",
+        })
+        mock_request.headers = {"X-API-Key": "test-key"}
+        mock_request.get_json.return_value = {"pr_id": "not-a-number", "commit_sha": "abc123def"}
+        
+        response, status = receive_webhook(mock_request)
+        
+        assert status == 400
+        assert "integer" in response["error"]
+
+    def test_commit_sha_too_short(self, mock_request, mocker):
+        """Returns 400 when commit_sha is too short."""
+        mocker.patch.dict("os.environ", {
+            "API_KEY": "test-key",
+            "VERTEX_PROJECT": "test-project",
+        })
+        mock_request.headers = {"X-API-Key": "test-key"}
+        mock_request.get_json.return_value = {"pr_id": 12345, "commit_sha": "abc"}
+        
+        response, status = receive_webhook(mock_request)
+        
+        assert status == 400
+        assert "7 characters" in response["error"]
+
+    def test_successful_publish(self, mock_request, mocker):
+        """Returns 202 and publishes to Pub/Sub on success."""
+        mocker.patch.dict("os.environ", {
+            "API_KEY": "test-key",
+            "VERTEX_PROJECT": "test-project",
+            "PUBSUB_TOPIC": "test-topic",
+        })
+        mock_request.headers = {"X-API-Key": "test-key"}
+        mock_request.get_json.return_value = {
+            "pr_id": 12345,
+            "commit_sha": "abc123def456789"
+        }
+        
+        # Mock Pub/Sub client
+        mock_future = MagicMock()
+        mock_future.result.return_value = "message-id-123"
+        
+        mock_publisher = MagicMock()
+        mock_publisher.topic_path.return_value = "projects/test-project/topics/test-topic"
+        mock_publisher.publish.return_value = mock_future
+        
+        mocker.patch("main.pubsub_v1.PublisherClient", return_value=mock_publisher)
+        
+        response, status = receive_webhook(mock_request)
+        
+        assert status == 202
+        assert response["status"] == "queued"
+        assert response["message_id"] == "message-id-123"
+        assert response["pr_id"] == 12345
+        assert response["commit_sha"] == "abc123de"  # truncated to 8 chars
+        
+        # Verify Pub/Sub was called correctly
+        mock_publisher.topic_path.assert_called_once_with("test-project", "test-topic")
+        mock_publisher.publish.assert_called_once()
+
+    def test_pubsub_message_format(self, mock_request, mocker):
+        """Verifies the Pub/Sub message contains expected fields."""
+        import json
+        
+        mocker.patch.dict("os.environ", {
+            "API_KEY": "test-key",
+            "VERTEX_PROJECT": "test-project",
+        })
+        mock_request.headers = {"X-API-Key": "test-key"}
+        mock_request.get_json.return_value = {
+            "pr_id": 12345,
+            "commit_sha": "abc123def456789"
+        }
+        
+        mock_future = MagicMock()
+        mock_future.result.return_value = "msg-123"
+        
+        mock_publisher = MagicMock()
+        mock_publisher.topic_path.return_value = "projects/test-project/topics/pr-review-trigger"
+        mock_publisher.publish.return_value = mock_future
+        
+        mocker.patch("main.pubsub_v1.PublisherClient", return_value=mock_publisher)
+        
+        receive_webhook(mock_request)
+        
+        # Get the message bytes that were published
+        publish_call = mock_publisher.publish.call_args
+        message_bytes = publish_call[0][1]  # Second positional arg
+        message = json.loads(message_bytes.decode("utf-8"))
+        
+        assert message["pr_id"] == 12345
+        assert message["commit_sha"] == "abc123def456789"
+        assert message["source"] == "azure-devops-pipeline"
+        assert "received_at" in message
+
+    def test_pubsub_publish_failure(self, mock_request, mocker):
+        """Returns 500 when Pub/Sub publish fails."""
+        mocker.patch.dict("os.environ", {
+            "API_KEY": "test-key",
+            "VERTEX_PROJECT": "test-project",
+        })
+        mock_request.headers = {"X-API-Key": "test-key"}
+        mock_request.get_json.return_value = {
+            "pr_id": 12345,
+            "commit_sha": "abc123def456789"
+        }
+        
+        mock_publisher = MagicMock()
+        mock_publisher.topic_path.return_value = "projects/test-project/topics/test-topic"
+        mock_publisher.publish.side_effect = Exception("Pub/Sub error")
+        
+        mocker.patch("main.pubsub_v1.PublisherClient", return_value=mock_publisher)
+        
+        response, status = receive_webhook(mock_request)
+        
+        assert status == 500
+        assert "Failed to queue" in response["error"]
+
+    def test_server_config_error(self, mock_request, mocker):
+        """Returns 500 when server config is missing."""
+        mocker.patch.dict("os.environ", {}, clear=True)
+        
+        response, status = receive_webhook(mock_request)
+        
+        assert status == 500
+        assert "configuration error" in response["error"]
+
+    def test_invalid_json_body(self, mock_request, mocker):
+        """Returns 400 when request body is not valid JSON."""
+        mocker.patch.dict("os.environ", {
+            "API_KEY": "test-key",
+            "VERTEX_PROJECT": "test-project",
+        })
+        mock_request.headers = {"X-API-Key": "test-key"}
+        mock_request.get_json.side_effect = Exception("Invalid JSON")
+        
+        response, status = receive_webhook(mock_request)
+        
+        assert status == 400
+        assert "Invalid JSON" in response["error"]
+
+    def test_empty_request_body(self, mock_request, mocker):
+        """Returns 400 when request body is empty."""
+        mocker.patch.dict("os.environ", {
+            "API_KEY": "test-key",
+            "VERTEX_PROJECT": "test-project",
+        })
+        mock_request.headers = {"X-API-Key": "test-key"}
+        mock_request.get_json.return_value = None
+        
+        response, status = receive_webhook(mock_request)
+        
+        assert status == 400
+        assert "Empty" in response["error"]
+
+    def test_pr_id_as_string_integer(self, mock_request, mocker):
+        """Accepts pr_id as string that can be parsed as integer."""
+        mocker.patch.dict("os.environ", {
+            "API_KEY": "test-key",
+            "VERTEX_PROJECT": "test-project",
+        })
+        mock_request.headers = {"X-API-Key": "test-key"}
+        mock_request.get_json.return_value = {
+            "pr_id": "12345",  # String, not int
+            "commit_sha": "abc123def456789"
+        }
+        
+        mock_future = MagicMock()
+        mock_future.result.return_value = "msg-123"
+        
+        mock_publisher = MagicMock()
+        mock_publisher.topic_path.return_value = "projects/test-project/topics/test-topic"
+        mock_publisher.publish.return_value = mock_future
+        
+        mocker.patch("main.pubsub_v1.PublisherClient", return_value=mock_publisher)
+        
+        response, status = receive_webhook(mock_request)
+        
+        assert status == 202
+        assert response["pr_id"] == 12345  # Converted to int
 
