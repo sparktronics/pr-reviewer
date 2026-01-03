@@ -1,4 +1,7 @@
-# Claude Code Rules
+# Agent Rules
+
+## Context
+- read documents under `.cursor/docs` to gain understanding
 
 ## Python Guidelines
 
