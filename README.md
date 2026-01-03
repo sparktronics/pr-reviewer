@@ -229,6 +229,7 @@ export VERTEX_LOCATION="us-central1"
 python3 -m functions_framework --target=review_pr --debug --port=8080
 
 # Or if functions-framework is in your PATH
+source .env
 functions-framework --target=review_pr --debug --port=8080
 ```
 

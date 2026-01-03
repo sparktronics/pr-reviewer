@@ -11,6 +11,8 @@
 
 ## **CRITICAL RULE** Agents and Artifical Intelligence:
 1. Read the rules in `.claude/rules.md` 
+2. Always create a new branch from main when implementing the code
+3. Be concise in your recommendations and notes
 
 ### Especially for Documentation Files
 

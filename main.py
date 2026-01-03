@@ -15,6 +15,12 @@ Environment Variables:
     AZURE_DEVOPS_REPO     - Repository name (or ID)
     VERTEX_PROJECT        - GCP Project ID
     VERTEX_LOCATION       - GCP Region (default: us-central1)
+    PUBSUB_TOPIC          - Pub/Sub topic for webhook messages (default: pr-review-trigger)
+
+Entry Points:
+    review_pr          - HTTP endpoint for synchronous PR review
+    review_pr_pubsub   - Pub/Sub triggered async PR review (with idempotency)
+    receive_webhook    - HTTP webhook receiver that publishes to Pub/Sub
 """
 
 import os
@@ -25,9 +31,14 @@ import requests
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+import base64
+
 import functions_framework
+from cloudevents.http import CloudEvent
 from google import genai
 from google.cloud import storage
+from google.cloud import pubsub_v1
+from google.api_core.exceptions import PreconditionFailed
 
 
 # =============================================================================
@@ -360,6 +371,115 @@ def save_to_storage(bucket_name: str, pr_id: int, review: str) -> str:
 
 
 # =============================================================================
+# Idempotency - Prevent duplicate processing via GCS markers
+# =============================================================================
+
+def check_and_claim_processing(bucket_name: str, pr_id: int, commit_sha: str) -> bool:
+    """
+    Check if this PR+commit has been processed. If not, claim it atomically.
+    
+    Uses GCS conditional writes (if_generation_match=0) to ensure only one
+    instance can claim processing for a given PR+commit combination.
+    
+    Args:
+        bucket_name: GCS bucket name
+        pr_id: Pull request ID
+        commit_sha: The commit SHA being reviewed
+        
+    Returns:
+        True if we should process (we claimed it)
+        False if already processed or claimed by another instance
+    """
+    logger.info(f"[IDEMPOTENCY] Checking marker for PR #{pr_id} @ {commit_sha[:8]}")
+    
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(f"idempotency/pr-{pr_id}-{commit_sha}.json")
+    
+    # Check if already processed
+    if blob.exists():
+        logger.info(f"[IDEMPOTENCY] PR #{pr_id} @ {commit_sha[:8]} already processed - SKIPPING")
+        return False
+    
+    # Try to claim it atomically
+    # if_generation_match=0 means "only succeed if file doesn't exist"
+    marker = {
+        "pr_id": pr_id,
+        "commit_sha": commit_sha,
+        "claimed_at": datetime.now(timezone.utc).isoformat(),
+        "status": "processing"
+    }
+    
+    try:
+        blob.upload_from_string(
+            json.dumps(marker, indent=2),
+            content_type="application/json",
+            if_generation_match=0  # Atomic: fails if file exists
+        )
+        logger.info(f"[IDEMPOTENCY] Claimed processing for PR #{pr_id} @ {commit_sha[:8]}")
+        return True
+    except PreconditionFailed:
+        logger.info(f"[IDEMPOTENCY] Race condition - another instance claimed PR #{pr_id} @ {commit_sha[:8]} - SKIPPING")
+        return False
+
+
+def update_marker_completed(bucket_name: str, pr_id: int, commit_sha: str,
+                            max_severity: str, commented: bool) -> None:
+    """
+    Update the idempotency marker after successful processing.
+    
+    Args:
+        bucket_name: GCS bucket name
+        pr_id: Pull request ID
+        commit_sha: The commit SHA that was reviewed
+        max_severity: The maximum severity found in the review
+        commented: Whether a comment was posted to the PR
+    """
+    logger.info(f"[IDEMPOTENCY] Updating marker for PR #{pr_id} @ {commit_sha[:8]} -> completed")
+    
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(f"idempotency/pr-{pr_id}-{commit_sha}.json")
+    
+    marker = {
+        "pr_id": pr_id,
+        "commit_sha": commit_sha,
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "status": "completed",
+        "max_severity": max_severity,
+        "commented": commented
+    }
+    
+    blob.upload_from_string(
+        json.dumps(marker, indent=2),
+        content_type="application/json"
+    )
+    logger.info(f"[IDEMPOTENCY] Marker updated: severity={max_severity}, commented={commented}")
+
+
+def delete_marker(bucket_name: str, pr_id: int, commit_sha: str) -> None:
+    """
+    Delete an idempotency marker (used on processing failure to allow retry).
+    
+    Args:
+        bucket_name: GCS bucket name
+        pr_id: Pull request ID
+        commit_sha: The commit SHA
+    """
+    logger.info(f"[IDEMPOTENCY] Deleting marker for PR #{pr_id} @ {commit_sha[:8]} (allowing retry)")
+    
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(f"idempotency/pr-{pr_id}-{commit_sha}.json")
+    
+    try:
+        blob.delete()
+        logger.info(f"[IDEMPOTENCY] Marker deleted for PR #{pr_id} @ {commit_sha[:8]}")
+    except Exception as e:
+        logger.warning(f"[IDEMPOTENCY] Failed to delete marker: {e}")
+
+
+# =============================================================================
 # Severity Detection
 # =============================================================================
 
@@ -390,7 +510,7 @@ Your expertise covers:
 - HTL (Sightly) templating
 - Vanilla JavaScript (no frameworks)
 - CSS styling
-- HTML structure and accessibility
+- HTML structure accessibility 
 
 ## Review Focus: Regression Testing for AEM Frontend Components
 
@@ -747,3 +867,329 @@ def review_pr(request):
             logger.error(f"[ERROR] Internal error | Type: {type(e).__name__} | {elapsed():.0f}ms")
             logger.error(f"[ERROR] Details: {str(e)}", exc_info=True)
             return make_response({"error": f"Internal error: {str(e)}"}, 500)
+
+
+# =============================================================================
+# Pub/Sub Cloud Function Entry Point (with Idempotency)
+# =============================================================================
+
+@functions_framework.cloud_event
+def review_pr_pubsub(cloud_event: CloudEvent) -> None:
+    """
+    Pub/Sub triggered Cloud Function entry point for PR regression review.
+    
+    Includes idempotency handling to prevent duplicate processing when
+    Pub/Sub delivers the same message multiple times (at-least-once delivery).
+    
+    Pub/Sub Message Format:
+        {
+            "pr_id": 12345,
+            "commit_sha": "abc123def...",  // Optional: provided by webhook receiver
+            "received_at": "2026-01-03T10:30:00Z",
+            "source": "azure-devops-pipeline"
+        }
+        
+    The function will:
+    1. Parse the PR ID and optional commit_sha from the Pub/Sub message
+    2. Fetch PR metadata (use commit_sha from message if provided)
+    3. Check idempotency marker (skip if already processed)
+    4. Process the PR review
+    5. Update the marker on completion
+    """
+    with timed_operation() as elapsed:
+        logger.info("=" * 60)
+        logger.info("[PUBSUB] PR Review function invoked via Pub/Sub")
+        
+        # Load config
+        config, missing = load_config()
+        if missing:
+            logger.error(f"[CONFIG] Missing required environment variables: {missing}")
+            # Don't raise - acknowledge message to prevent infinite retries on config errors
+            return
+        logger.info("[CONFIG] All required environment variables loaded")
+        
+        # Parse Pub/Sub message
+        try:
+            message_data = cloud_event.data.get("message", {}).get("data", "")
+            if message_data:
+                decoded = base64.b64decode(message_data).decode("utf-8")
+                message = json.loads(decoded)
+            else:
+                logger.error("[PUBSUB] Empty message data")
+                return
+            
+            pr_id = message.get("pr_id")
+            if not pr_id:
+                logger.error("[PUBSUB] Missing pr_id in message")
+                return
+            
+            pr_id = int(pr_id)
+            
+            # Extract commit_sha from message (provided by webhook receiver)
+            message_commit_sha = message.get("commit_sha")
+            if message_commit_sha:
+                logger.info(f"[PUBSUB] Processing PR #{pr_id} @ {message_commit_sha[:8]} (from message)")
+            else:
+                logger.info(f"[PUBSUB] Processing PR #{pr_id} (commit_sha will be fetched from ADO)")
+            
+        except (ValueError, TypeError, json.JSONDecodeError) as e:
+            logger.error(f"[PUBSUB] Failed to parse message: {e}")
+            return  # Acknowledge to prevent retries on malformed messages
+        
+        # Initialize Azure DevOps client
+        logger.info(f"[ADO] Initializing client | Org: {config['AZURE_DEVOPS_ORG']} | Project: {config['AZURE_DEVOPS_PROJECT']}")
+        ado = AzureDevOpsClient(
+            org=config["AZURE_DEVOPS_ORG"],
+            project=config["AZURE_DEVOPS_PROJECT"],
+            repo=config["AZURE_DEVOPS_REPO"],
+            pat=config["AZURE_DEVOPS_PAT"],
+        )
+        
+        commit_sha = None
+        
+        try:
+            # Fetch PR metadata
+            logger.info(f"[FLOW] Step 1/6: Fetching PR metadata")
+            pr = ado.get_pull_request(pr_id)
+            pr_title = pr.get("title", "Untitled")
+            pr_author = pr.get("createdBy", {}).get("displayName", "Unknown")
+            
+            # Use commit_sha from message if provided, otherwise fetch from PR metadata
+            if message_commit_sha:
+                commit_sha = message_commit_sha
+                logger.info(f"[FLOW] Using commit_sha from message: {commit_sha[:8]}")
+            else:
+                commit_sha = pr["lastMergeSourceCommit"]["commitId"]
+                logger.info(f"[FLOW] Fetched commit_sha from ADO: {commit_sha[:8]}")
+            
+            logger.info(f"[FLOW] PR: '{pr_title}' by {pr_author} @ commit {commit_sha[:8]}")
+            
+            # Idempotency check
+            logger.info(f"[FLOW] Step 2/6: Checking idempotency")
+            bucket_name = config["GCS_BUCKET"]
+            if not check_and_claim_processing(bucket_name, pr_id, commit_sha):
+                logger.info(f"[COMPLETE] PR #{pr_id} @ {commit_sha[:8]} already processed | {elapsed():.0f}ms")
+                logger.info("=" * 60)
+                return  # Already processed - acknowledge and exit
+            
+            # Fetch file diffs
+            logger.info(f"[FLOW] Step 3/6: Fetching file diffs")
+            file_diffs = ado.get_pr_diff(pr_id)
+            
+            if not file_diffs:
+                logger.info(f"[FLOW] No file changes found")
+                update_marker_completed(bucket_name, pr_id, commit_sha, "info", False)
+                logger.info(f"[COMPLETE] PR #{pr_id} - no files to review | {elapsed():.0f}ms")
+                logger.info("=" * 60)
+                return
+            
+            logger.info(f"[FLOW] Found {len(file_diffs)} files to review")
+            
+            # Build prompt and call Gemini
+            logger.info(f"[FLOW] Step 4/6: Building prompt and calling Gemini")
+            prompt = build_review_prompt(pr, file_diffs)
+            logger.info(f"[FLOW] Prompt built: {len(prompt)} chars")
+            
+            review = call_gemini(config, prompt)
+            
+            # Determine severity
+            logger.info(f"[FLOW] Step 5/6: Analyzing severity")
+            max_severity = get_max_severity(review)
+            has_blocking = max_severity == "blocking"
+            has_warning = max_severity == "warning"
+            logger.info(f"[FLOW] Severity: {max_severity.upper()}")
+            
+            # Save to Cloud Storage
+            logger.info(f"[FLOW] Step 6/6: Saving to Cloud Storage and taking action")
+            storage_path = save_to_storage(bucket_name, pr_id, review)
+            
+            # Take action based on severity
+            commented = False
+            
+            if has_blocking or has_warning:
+                logger.info(f"[ACTION] Posting review comment to PR #{pr_id}")
+                comment_header = "## 🤖 Automated Regression Review\n\n"
+                if has_blocking:
+                    comment_header += "⛔ **Sorry Dave, I can't merge you this time. This PR has been automatically rejected due to blocking issues.**\n\n"
+                else:
+                    comment_header += "⚠️ **Warning: This PR has potential issues that should be reviewed.**\n\n"
+                
+                comment_header += f"📁 Full review saved to: `{storage_path}`\n\n---\n\n"
+                
+                ado.post_pr_comment(pr_id, comment_header + review)
+                commented = True
+                logger.info(f"[ACTION] Comment posted successfully")
+                
+                if has_blocking:
+                    logger.info(f"[ACTION] Rejecting PR due to blocking issues")
+                    user_id = ado.get_current_user_id()
+                    ado.reject_pr(pr_id, user_id)
+                    logger.info(f"[ACTION] PR #{pr_id} rejected")
+            
+            # Update idempotency marker with completion status
+            update_marker_completed(bucket_name, pr_id, commit_sha, max_severity, commented)
+            
+            logger.info(f"[COMPLETE] PR #{pr_id} @ {commit_sha[:8]} review finished | Severity: {max_severity} | {elapsed():.0f}ms")
+            logger.info("=" * 60)
+            
+        except requests.HTTPError as e:
+            logger.error(f"[ERROR] Azure DevOps API error | Status: {e.response.status_code} | {elapsed():.0f}ms")
+            # Delete marker to allow retry
+            if commit_sha:
+                delete_marker(config["GCS_BUCKET"], pr_id, commit_sha)
+            raise  # Re-raise to trigger Pub/Sub retry
+            
+        except Exception as e:
+            logger.error(f"[ERROR] Internal error | Type: {type(e).__name__} | {elapsed():.0f}ms")
+            logger.error(f"[ERROR] Details: {str(e)}", exc_info=True)
+            # Delete marker to allow retry
+            if commit_sha:
+                delete_marker(config["GCS_BUCKET"], pr_id, commit_sha)
+            raise  # Re-raise to trigger Pub/Sub retry
+
+
+# =============================================================================
+# Webhook Receiver Cloud Function Entry Point
+# =============================================================================
+
+def load_webhook_config() -> tuple[dict, list]:
+    """Load minimal configuration for webhook receiver.
+    
+    Returns:
+        tuple: (config dict, list of missing required vars)
+    """
+    required = ["API_KEY", "VERTEX_PROJECT"]
+    
+    config = {}
+    missing = []
+    
+    for var in required:
+        value = os.environ.get(var)
+        if not value:
+            missing.append(var)
+        config[var] = value
+    
+    # Optional with default
+    config["PUBSUB_TOPIC"] = os.environ.get("PUBSUB_TOPIC", "pr-review-trigger")
+    
+    return config, missing
+
+
+@functions_framework.http
+def receive_webhook(request):
+    """
+    HTTP webhook receiver for Azure DevOps pipeline.
+    
+    Validates the request and publishes a message to Pub/Sub for async processing.
+    This decouples the webhook acknowledgment from the actual PR review processing.
+    
+    Request Format:
+        POST /
+        Content-Type: application/json
+        X-API-Key: <api-key>
+        
+        {
+            "pr_id": 357462,
+            "commit_sha": "abc123def456789..."
+        }
+    
+    Response (202 Accepted):
+        {
+            "status": "queued",
+            "message_id": "1234567890",
+            "pr_id": 357462,
+            "commit_sha": "abc123de"
+        }
+    """
+    with timed_operation() as elapsed:
+        logger.info("=" * 60)
+        logger.info("[WEBHOOK] PR Review webhook received")
+        
+        # Load minimal config (only need API_KEY and PUBSUB_TOPIC)
+        config, missing = load_webhook_config()
+        if missing:
+            logger.error(f"[CONFIG] Missing required environment variables: {missing}")
+            return {"error": f"Server configuration error: missing {missing}"}, 500
+        
+        # Validate API key
+        api_key = request.headers.get("X-API-Key")
+        if not api_key:
+            logger.warning("[AUTH] Missing X-API-Key header")
+            return {"error": "Missing X-API-Key header"}, 401
+        
+        if api_key != config["API_KEY"]:
+            logger.warning("[AUTH] Invalid API key")
+            return {"error": "Invalid API key"}, 401
+        
+        logger.info("[AUTH] API key validated")
+        
+        # Parse JSON body
+        try:
+            data = request.get_json(force=True)
+        except Exception as e:
+            logger.error(f"[PARSE] Invalid JSON body: {e}")
+            return {"error": "Invalid JSON body"}, 400
+        
+        if not data:
+            logger.error("[PARSE] Empty request body")
+            return {"error": "Empty request body"}, 400
+        
+        # Validate required fields
+        pr_id = data.get("pr_id")
+        commit_sha = data.get("commit_sha")
+        
+        if not pr_id:
+            logger.error("[PARSE] Missing pr_id in request")
+            return {"error": "Missing required field: pr_id"}, 400
+        
+        if not commit_sha:
+            logger.error("[PARSE] Missing commit_sha in request")
+            return {"error": "Missing required field: commit_sha"}, 400
+        
+        # Validate types
+        try:
+            pr_id = int(pr_id)
+        except (ValueError, TypeError):
+            logger.error(f"[PARSE] Invalid pr_id: {pr_id}")
+            return {"error": "pr_id must be an integer"}, 400
+        
+        if not isinstance(commit_sha, str) or len(commit_sha) < 7:
+            logger.error(f"[PARSE] Invalid commit_sha: {commit_sha}")
+            return {"error": "commit_sha must be a string of at least 7 characters"}, 400
+        
+        logger.info(f"[WEBHOOK] PR #{pr_id} @ {commit_sha[:8]}")
+        
+        # Build Pub/Sub message
+        message = {
+            "pr_id": pr_id,
+            "commit_sha": commit_sha,
+            "received_at": datetime.now(timezone.utc).isoformat(),
+            "source": "azure-devops-pipeline"
+        }
+        
+        # Publish to Pub/Sub
+        try:
+            publisher = pubsub_v1.PublisherClient()
+            topic_path = publisher.topic_path(config["VERTEX_PROJECT"], config["PUBSUB_TOPIC"])
+            
+            message_bytes = json.dumps(message).encode("utf-8")
+            
+            with timed_operation() as pubsub_elapsed:
+                future = publisher.publish(topic_path, message_bytes)
+                message_id = future.result(timeout=30)
+            
+            logger.info(f"[PUBSUB] Published message {message_id} to {config['PUBSUB_TOPIC']} | {pubsub_elapsed():.0f}ms")
+            
+        except Exception as e:
+            logger.error(f"[PUBSUB] Failed to publish message: {e}")
+            return {"error": f"Failed to queue message: {str(e)}"}, 500
+        
+        logger.info(f"[COMPLETE] Webhook processed | PR #{pr_id} queued | {elapsed():.0f}ms")
+        logger.info("=" * 60)
+        
+        return {
+            "status": "queued",
+            "message_id": message_id,
+            "pr_id": pr_id,
+            "commit_sha": commit_sha[:8]
+        }, 202

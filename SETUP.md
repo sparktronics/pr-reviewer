@@ -41,7 +41,7 @@ This is the most convenient method as the variables persist across terminal sess
 
 4. **Run the script** (it will automatically load `.env`):
    ```bash
-   python3 pr_regression_review.py 357462
+   python3 main.py 357462
    ```
 
 **Note:** The `.env` file is automatically ignored by git (listed in `.gitignore`) so your secrets stay safe!
@@ -117,7 +117,7 @@ else:
 Once environment variables are set:
 
 ```bash
-python3 pr_regression_review.py 357462
+python3 main.py 357462
 ```
 
 Replace `357462` with your actual PR ID.
