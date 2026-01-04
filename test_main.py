@@ -15,7 +15,9 @@ from main import (
     build_review_prompt,
     check_and_claim_processing,
     update_marker_completed,
-    delete_marker,
+    update_marker_for_retry,
+    update_marker_failed,
+    MAX_RETRY_ATTEMPTS,
     load_webhook_config,
     receive_webhook,
 )
@@ -349,10 +351,17 @@ class TestCheckAndClaimProcessing:
         assert call_kwargs["if_generation_match"] == 0
         assert call_kwargs["content_type"] == "application/json"
 
-    def test_skip_when_marker_exists(self, mocker):
-        """Returns False when marker already exists."""
+    def test_skip_when_marker_completed(self, mocker):
+        """Returns False when marker exists with completed status."""
+        import json
+        
         mock_blob = MagicMock()
         mock_blob.exists.return_value = True
+        mock_blob.download_as_text.return_value = json.dumps({
+            "pr_id": 12345,
+            "commit_sha": "abc123def456",
+            "status": "completed"
+        })
         
         mock_bucket = MagicMock()
         mock_bucket.blob.return_value = mock_blob
@@ -366,6 +375,81 @@ class TestCheckAndClaimProcessing:
         
         assert result is False
         mock_blob.upload_from_string.assert_not_called()
+
+    def test_skip_when_marker_failed(self, mocker):
+        """Returns False when marker exists with failed status."""
+        import json
+        
+        mock_blob = MagicMock()
+        mock_blob.exists.return_value = True
+        mock_blob.download_as_text.return_value = json.dumps({
+            "pr_id": 12345,
+            "commit_sha": "abc123def456",
+            "status": "failed",
+            "retry_count": 3
+        })
+        
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+        
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        
+        mocker.patch("main.storage.Client", return_value=mock_client)
+        
+        result = check_and_claim_processing("test-bucket", 12345, "abc123def456")
+        
+        assert result is False
+
+    def test_allow_retry_when_processing_under_limit(self, mocker):
+        """Returns True when marker is processing and retry_count < MAX."""
+        import json
+        
+        mock_blob = MagicMock()
+        mock_blob.exists.return_value = True
+        mock_blob.download_as_text.return_value = json.dumps({
+            "pr_id": 12345,
+            "commit_sha": "abc123def456",
+            "status": "processing",
+            "retry_count": 1
+        })
+        
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+        
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        
+        mocker.patch("main.storage.Client", return_value=mock_client)
+        
+        result = check_and_claim_processing("test-bucket", 12345, "abc123def456")
+        
+        assert result is True
+
+    def test_skip_when_max_retries_exceeded(self, mocker):
+        """Returns False when marker is processing but retry_count >= MAX."""
+        import json
+        
+        mock_blob = MagicMock()
+        mock_blob.exists.return_value = True
+        mock_blob.download_as_text.return_value = json.dumps({
+            "pr_id": 12345,
+            "commit_sha": "abc123def456",
+            "status": "processing",
+            "retry_count": MAX_RETRY_ATTEMPTS
+        })
+        
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+        
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        
+        mocker.patch("main.storage.Client", return_value=mock_client)
+        
+        result = check_and_claim_processing("test-bucket", 12345, "abc123def456")
+        
+        assert result is False
 
     def test_skip_on_race_condition(self, mocker):
         """Returns False when another instance claimed marker (PreconditionFailed)."""
@@ -409,6 +493,7 @@ class TestCheckAndClaimProcessing:
         assert marker["pr_id"] == 12345
         assert marker["commit_sha"] == "abc123def456"
         assert marker["status"] == "processing"
+        assert marker["retry_count"] == 0
         assert "claimed_at" in marker
 
 
@@ -445,11 +530,102 @@ class TestUpdateMarkerCompleted:
         assert "processed_at" in marker
 
 
-class TestDeleteMarker:
-    """Tests for delete_marker function."""
+class TestUpdateMarkerForRetry:
+    """Tests for update_marker_for_retry function."""
 
-    def test_delete_marker_success(self, mocker):
-        """Deletes marker blob successfully."""
+    def test_first_retry_returns_true(self, mocker):
+        """Returns True on first retry (retry_count < MAX)."""
+        import json
+        
+        mock_blob = MagicMock()
+        mock_blob.exists.return_value = True
+        mock_blob.download_as_text.return_value = json.dumps({
+            "pr_id": 12345,
+            "commit_sha": "abc123def456",
+            "status": "processing",
+            "retry_count": 0
+        })
+        
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+        
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        
+        mocker.patch("main.storage.Client", return_value=mock_client)
+        
+        result = update_marker_for_retry("test-bucket", 12345, "abc123def456", "Test error")
+        
+        assert result is True
+        
+        # Verify marker was updated with incremented retry_count
+        uploaded_content = mock_blob.upload_from_string.call_args[0][0]
+        marker = json.loads(uploaded_content)
+        assert marker["retry_count"] == 1
+        assert marker["status"] == "processing"
+
+    def test_max_retries_returns_false(self, mocker):
+        """Returns False when max retries exceeded."""
+        import json
+        
+        mock_blob = MagicMock()
+        mock_blob.exists.return_value = True
+        mock_blob.download_as_text.return_value = json.dumps({
+            "pr_id": 12345,
+            "commit_sha": "abc123def456",
+            "status": "processing",
+            "retry_count": MAX_RETRY_ATTEMPTS - 1  # One more will exceed
+        })
+        
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+        
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        
+        mocker.patch("main.storage.Client", return_value=mock_client)
+        
+        result = update_marker_for_retry("test-bucket", 12345, "abc123def456", "Test error")
+        
+        assert result is False
+        
+        # Verify marker was updated with failed status
+        uploaded_content = mock_blob.upload_from_string.call_args[0][0]
+        marker = json.loads(uploaded_content)
+        assert marker["status"] == "failed"
+        assert marker["retry_count"] == MAX_RETRY_ATTEMPTS
+
+    def test_no_existing_marker_starts_at_one(self, mocker):
+        """Starts retry_count at 1 when no existing marker."""
+        import json
+        
+        mock_blob = MagicMock()
+        mock_blob.exists.return_value = False
+        
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+        
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        
+        mocker.patch("main.storage.Client", return_value=mock_client)
+        
+        result = update_marker_for_retry("test-bucket", 12345, "abc123def456", "Test error")
+        
+        assert result is True
+        
+        uploaded_content = mock_blob.upload_from_string.call_args[0][0]
+        marker = json.loads(uploaded_content)
+        assert marker["retry_count"] == 1
+
+
+class TestUpdateMarkerFailed:
+    """Tests for update_marker_failed function."""
+
+    def test_marks_as_permanently_failed(self, mocker):
+        """Creates marker with failed status and non_retryable reason."""
+        import json
+        
         mock_blob = MagicMock()
         mock_bucket = MagicMock()
         mock_bucket.blob.return_value = mock_blob
@@ -459,16 +635,25 @@ class TestDeleteMarker:
         
         mocker.patch("main.storage.Client", return_value=mock_client)
         
-        delete_marker("test-bucket", 12345, "abc123def456")
+        update_marker_failed("test-bucket", 12345, "abc123def456", "401 Unauthorized")
         
         mock_bucket.blob.assert_called_once_with("idempotency/pr-12345-abc123def456.json")
-        mock_blob.delete.assert_called_once()
-
-    def test_delete_marker_handles_error(self, mocker):
-        """Handles deletion errors gracefully (doesn't raise)."""
-        mock_blob = MagicMock()
-        mock_blob.delete.side_effect = Exception("Blob not found")
         
+        uploaded_content = mock_blob.upload_from_string.call_args[0][0]
+        marker = json.loads(uploaded_content)
+        
+        assert marker["pr_id"] == 12345
+        assert marker["commit_sha"] == "abc123def456"
+        assert marker["status"] == "failed"
+        assert marker["reason"] == "non_retryable_error"
+        assert marker["error"] == "401 Unauthorized"
+        assert "failed_at" in marker
+
+    def test_truncates_long_error_messages(self, mocker):
+        """Truncates error messages longer than 500 chars."""
+        import json
+        
+        mock_blob = MagicMock()
         mock_bucket = MagicMock()
         mock_bucket.blob.return_value = mock_blob
         
@@ -477,8 +662,13 @@ class TestDeleteMarker:
         
         mocker.patch("main.storage.Client", return_value=mock_client)
         
-        # Should not raise
-        delete_marker("test-bucket", 12345, "abc123def456")
+        long_error = "x" * 1000
+        update_marker_failed("test-bucket", 12345, "abc123def456", long_error)
+        
+        uploaded_content = mock_blob.upload_from_string.call_args[0][0]
+        marker = json.loads(uploaded_content)
+        
+        assert len(marker["error"]) == 500
 
 
 class TestIdempotencyKeyFormat:
