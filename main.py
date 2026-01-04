@@ -374,6 +374,9 @@ def save_to_storage(bucket_name: str, pr_id: int, review: str) -> str:
 # Idempotency - Prevent duplicate processing via GCS markers
 # =============================================================================
 
+MAX_RETRY_ATTEMPTS = 3  # Maximum number of retry attempts before giving up
+
+
 def check_and_claim_processing(bucket_name: str, pr_id: int, commit_sha: str) -> bool:
     """
     Check if this PR+commit has been processed. If not, claim it atomically.
@@ -381,14 +384,17 @@ def check_and_claim_processing(bucket_name: str, pr_id: int, commit_sha: str) ->
     Uses GCS conditional writes (if_generation_match=0) to ensure only one
     instance can claim processing for a given PR+commit combination.
     
+    Also handles retry logic: if a marker exists with status "processing" and
+    retry_count < MAX_RETRY_ATTEMPTS, allows processing to continue (retry).
+    
     Args:
         bucket_name: GCS bucket name
         pr_id: Pull request ID
         commit_sha: The commit SHA being reviewed
         
     Returns:
-        True if we should process (we claimed it)
-        False if already processed or claimed by another instance
+        True if we should process (we claimed it or it's a valid retry)
+        False if already completed, failed permanently, or claimed by another instance
     """
     logger.info(f"[IDEMPOTENCY] Checking marker for PR #{pr_id} @ {commit_sha[:8]}")
     
@@ -396,10 +402,36 @@ def check_and_claim_processing(bucket_name: str, pr_id: int, commit_sha: str) ->
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(f"idempotency/pr-{pr_id}-{commit_sha}.json")
     
-    # Check if already processed
+    # Check if marker exists
     if blob.exists():
-        logger.info(f"[IDEMPOTENCY] PR #{pr_id} @ {commit_sha[:8]} already processed - SKIPPING")
-        return False
+        # Read existing marker to check status
+        try:
+            marker_data = json.loads(blob.download_as_text())
+            status = marker_data.get("status", "unknown")
+            retry_count = marker_data.get("retry_count", 0)
+            
+            if status == "completed":
+                logger.info(f"[IDEMPOTENCY] PR #{pr_id} @ {commit_sha[:8]} already completed - SKIPPING")
+                return False
+            
+            if status == "failed":
+                logger.info(f"[IDEMPOTENCY] PR #{pr_id} @ {commit_sha[:8]} permanently failed after {retry_count} attempts - SKIPPING")
+                return False
+            
+            if status == "processing":
+                # This is a retry - check if we've exceeded max attempts
+                if retry_count >= MAX_RETRY_ATTEMPTS:
+                    logger.warning(f"[IDEMPOTENCY] PR #{pr_id} @ {commit_sha[:8]} exceeded max retries ({MAX_RETRY_ATTEMPTS}) - SKIPPING")
+                    return False
+                logger.info(f"[IDEMPOTENCY] PR #{pr_id} @ {commit_sha[:8]} retry attempt {retry_count + 1}/{MAX_RETRY_ATTEMPTS}")
+                return True
+                
+        except json.JSONDecodeError:
+            logger.warning(f"[IDEMPOTENCY] Corrupted marker for PR #{pr_id} - allowing processing")
+            # Fall through to create new marker
+        except Exception as e:
+            logger.warning(f"[IDEMPOTENCY] Error reading marker: {e} - allowing processing")
+            return True  # Allow processing on read errors
     
     # Try to claim it atomically
     # if_generation_match=0 means "only succeed if file doesn't exist"
@@ -407,7 +439,8 @@ def check_and_claim_processing(bucket_name: str, pr_id: int, commit_sha: str) ->
         "pr_id": pr_id,
         "commit_sha": commit_sha,
         "claimed_at": datetime.now(timezone.utc).isoformat(),
-        "status": "processing"
+        "status": "processing",
+        "retry_count": 0
     }
     
     try:
@@ -457,26 +490,106 @@ def update_marker_completed(bucket_name: str, pr_id: int, commit_sha: str,
     logger.info(f"[IDEMPOTENCY] Marker updated: severity={max_severity}, commented={commented}")
 
 
-def delete_marker(bucket_name: str, pr_id: int, commit_sha: str) -> None:
+def update_marker_for_retry(bucket_name: str, pr_id: int, commit_sha: str, error_msg: str) -> bool:
     """
-    Delete an idempotency marker (used on processing failure to allow retry).
+    Update idempotency marker after a processing failure to track retry attempts.
+    
+    Increments the retry counter. If max retries exceeded, marks as permanently failed.
     
     Args:
         bucket_name: GCS bucket name
         pr_id: Pull request ID
         commit_sha: The commit SHA
+        error_msg: Error message describing the failure
+        
+    Returns:
+        True if retry should be attempted (re-raise exception)
+        False if max retries exceeded (acknowledge message to stop retries)
     """
-    logger.info(f"[IDEMPOTENCY] Deleting marker for PR #{pr_id} @ {commit_sha[:8]} (allowing retry)")
+    logger.info(f"[IDEMPOTENCY] Updating marker for retry: PR #{pr_id} @ {commit_sha[:8]}")
     
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(f"idempotency/pr-{pr_id}-{commit_sha}.json")
     
+    # Read existing marker to get retry count
+    retry_count = 0
     try:
-        blob.delete()
-        logger.info(f"[IDEMPOTENCY] Marker deleted for PR #{pr_id} @ {commit_sha[:8]}")
+        if blob.exists():
+            marker_data = json.loads(blob.download_as_text())
+            retry_count = marker_data.get("retry_count", 0)
     except Exception as e:
-        logger.warning(f"[IDEMPOTENCY] Failed to delete marker: {e}")
+        logger.warning(f"[IDEMPOTENCY] Error reading marker: {e}")
+    
+    # Increment retry count
+    retry_count += 1
+    
+    if retry_count >= MAX_RETRY_ATTEMPTS:
+        # Max retries exceeded - mark as permanently failed
+        marker = {
+            "pr_id": pr_id,
+            "commit_sha": commit_sha,
+            "status": "failed",
+            "retry_count": retry_count,
+            "failed_at": datetime.now(timezone.utc).isoformat(),
+            "last_error": error_msg[:500]  # Truncate long error messages
+        }
+        blob.upload_from_string(
+            json.dumps(marker, indent=2),
+            content_type="application/json"
+        )
+        logger.error(f"[IDEMPOTENCY] PR #{pr_id} @ {commit_sha[:8]} marked as FAILED after {retry_count} attempts")
+        return False  # Don't retry - acknowledge message
+    
+    # Update marker with incremented retry count
+    marker = {
+        "pr_id": pr_id,
+        "commit_sha": commit_sha,
+        "status": "processing",
+        "retry_count": retry_count,
+        "last_attempt_at": datetime.now(timezone.utc).isoformat(),
+        "last_error": error_msg[:500]
+    }
+    blob.upload_from_string(
+        json.dumps(marker, indent=2),
+        content_type="application/json"
+    )
+    logger.info(f"[IDEMPOTENCY] PR #{pr_id} @ {commit_sha[:8]} retry count: {retry_count}/{MAX_RETRY_ATTEMPTS}")
+    return True  # Retry - re-raise exception
+
+
+def update_marker_failed(bucket_name: str, pr_id: int, commit_sha: str, error_msg: str) -> None:
+    """
+    Mark an idempotency marker as permanently failed (non-retryable error).
+    
+    Used for errors like 401/403/404 that won't be resolved by retrying.
+    
+    Args:
+        bucket_name: GCS bucket name
+        pr_id: Pull request ID
+        commit_sha: The commit SHA
+        error_msg: Error message describing the failure
+    """
+    logger.info(f"[IDEMPOTENCY] Marking PR #{pr_id} @ {commit_sha[:8]} as permanently FAILED")
+    
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(f"idempotency/pr-{pr_id}-{commit_sha}.json")
+    
+    marker = {
+        "pr_id": pr_id,
+        "commit_sha": commit_sha,
+        "status": "failed",
+        "failed_at": datetime.now(timezone.utc).isoformat(),
+        "error": error_msg[:500],
+        "reason": "non_retryable_error"
+    }
+    
+    blob.upload_from_string(
+        json.dumps(marker, indent=2),
+        content_type="application/json"
+    )
+    logger.error(f"[IDEMPOTENCY] PR #{pr_id} @ {commit_sha[:8]} marked as FAILED (non-retryable)")
 
 
 # =============================================================================
@@ -959,7 +1072,12 @@ def review_pr_pubsub(cloud_event: CloudEvent) -> None:
                 commit_sha = message_commit_sha
                 logger.info(f"[FLOW] Using commit_sha from message: {commit_sha[:8]}")
             else:
-                commit_sha = pr["lastMergeSourceCommit"]["commitId"]
+                last_merge_commit = pr.get("lastMergeSourceCommit")
+                if not last_merge_commit or "commitId" not in last_merge_commit:
+                    logger.warning(f"[SKIP] PR #{pr_id} has no lastMergeSourceCommit - may be draft or empty")
+                    logger.info("=" * 60)
+                    return
+                commit_sha = last_merge_commit["commitId"]
                 logger.info(f"[FLOW] Fetched commit_sha from ADO: {commit_sha[:8]}")
             
             logger.info(f"[FLOW] PR: '{pr_title}' by {pr_author} @ commit {commit_sha[:8]}")
@@ -1033,18 +1151,41 @@ def review_pr_pubsub(cloud_event: CloudEvent) -> None:
             logger.info("=" * 60)
             
         except requests.HTTPError as e:
-            logger.error(f"[ERROR] Azure DevOps API error | Status: {e.response.status_code} | {elapsed():.0f}ms")
-            # Delete marker to allow retry
+            status_code = e.response.status_code if e.response is not None else 0
+            error_msg = f"Azure DevOps API error: {status_code}"
+            logger.error(f"[ERROR] {error_msg} | {elapsed():.0f}ms")
+            
+            # Non-retryable HTTP errors - acknowledge immediately (will go to DLQ)
+            # 401: Unauthorized (bad PAT), 403: Forbidden (no permissions), 404: PR not found
+            non_retryable_codes = {401, 403, 404}
+            if status_code in non_retryable_codes:
+                logger.error(f"[DLQ] Non-retryable error {status_code} for PR #{pr_id} - acknowledging for DLQ")
+                if commit_sha:
+                    # Mark as permanently failed
+                    update_marker_failed(config["GCS_BUCKET"], pr_id, commit_sha, error_msg)
+                logger.info("=" * 60)
+                raise  # Re-raise to send to DLQ (Pub/Sub will not retry after max attempts)
+            
+            # Retryable errors - update counter and check limit
             if commit_sha:
-                delete_marker(config["GCS_BUCKET"], pr_id, commit_sha)
+                should_retry = update_marker_for_retry(config["GCS_BUCKET"], pr_id, commit_sha, error_msg)
+                if not should_retry:
+                    logger.error(f"[ABORT] PR #{pr_id} @ {commit_sha[:8]} max retries exceeded - giving up")
+                    logger.info("=" * 60)
+                    return  # Acknowledge message to stop retries
             raise  # Re-raise to trigger Pub/Sub retry
             
         except Exception as e:
+            error_msg = f"{type(e).__name__}: {str(e)}"
             logger.error(f"[ERROR] Internal error | Type: {type(e).__name__} | {elapsed():.0f}ms")
             logger.error(f"[ERROR] Details: {str(e)}", exc_info=True)
-            # Delete marker to allow retry
+            # Update retry counter and check if we should retry
             if commit_sha:
-                delete_marker(config["GCS_BUCKET"], pr_id, commit_sha)
+                should_retry = update_marker_for_retry(config["GCS_BUCKET"], pr_id, commit_sha, error_msg)
+                if not should_retry:
+                    logger.error(f"[ABORT] PR #{pr_id} @ {commit_sha[:8]} max retries exceeded - giving up")
+                    logger.info("=" * 60)
+                    return  # Acknowledge message to stop retries
             raise  # Re-raise to trigger Pub/Sub retry
 
 
