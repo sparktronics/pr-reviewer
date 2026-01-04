@@ -4,11 +4,9 @@ on:
   pull_request:
     types: [opened, synchronize]
     # Optional: Only run on specific file changes
-    # paths:
-    #   - "src/**/*.ts"
-    #   - "src/**/*.tsx"
-    #   - "src/**/*.js"
-    #   - "src/**/*.jsx"
+    paths:
+      - "*.py"
+
 
 jobs:
   claude-review:
@@ -41,7 +39,7 @@ jobs:
             PR NUMBER: ${{ github.event.pull_request.number }}
 
             Please review this pull request and provide feedback on:
-            - Code quality and best practices
+            - Code quality and best practices: SRP, DRY, KISS, YAGNI, etc.
             - Potential bugs or issues
             - Performance considerations
             - Security concerns

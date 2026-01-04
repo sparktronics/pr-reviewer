@@ -34,5 +34,5 @@ echo "These variables are now available in your current shell session."
 echo "To make them permanent, add them to your ~/.zshrc or ~/.bashrc"
 echo ""
 echo "You can now run:"
-echo "  python3 pr_regression_review.py <PR_ID>"
+echo "  python3 main.py <PR_ID>"
 

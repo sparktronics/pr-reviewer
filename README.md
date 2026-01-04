@@ -229,6 +229,7 @@ export VERTEX_LOCATION="us-central1"
 python3 -m functions_framework --target=review_pr --debug --port=8080
 
 # Or if functions-framework is in your PATH
+source .env
 functions-framework --target=review_pr --debug --port=8080
 ```
 
@@ -268,6 +269,76 @@ The debugger configuration automatically:
 - **Logging**: Check the console for detailed request/response logs
 - **Network access**: Use `http://0.0.0.0:8080` to test from other devices on your network
 - **Stop server**: Press `Ctrl+C` in the terminal
+
+## Pub/Sub Dead Letter Queue (DLQ) Configuration
+
+For production deployments, configure a Dead Letter Queue to capture failed messages after retry attempts are exhausted. This prevents infinite retry loops and allows manual inspection of failures.
+
+### Step 1: Create Dead Letter Topic and Subscription
+
+```bash
+# Create dead letter topic
+gcloud pubsub topics create pr-review-dlq
+
+# Create subscription to inspect failed messages
+gcloud pubsub subscriptions create pr-review-dlq-sub \
+  --topic=pr-review-dlq \
+  --ack-deadline=60
+```
+
+### Step 2: Configure Main Subscription with DLQ
+
+```bash
+# Update your existing subscription to use the DLQ
+gcloud pubsub subscriptions update pr-review-sub \
+  --dead-letter-topic=pr-review-dlq \
+  --max-delivery-attempts=5
+```
+
+### Step 3: Grant Required Permissions
+
+The Pub/Sub service account needs permissions to publish to the DLQ:
+
+```bash
+# Get your project number
+PROJECT_NUMBER=$(gcloud projects describe $(gcloud config get-value project) --format="value(projectNumber)")
+
+# Grant publisher role on DLQ topic
+gcloud pubsub topics add-iam-policy-binding pr-review-dlq \
+  --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-pubsub.iam.gserviceaccount.com" \
+  --role="roles/pubsub.publisher"
+
+# Grant subscriber role on main subscription (for acknowledgment)
+gcloud pubsub subscriptions add-iam-policy-binding pr-review-sub \
+  --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-pubsub.iam.gserviceaccount.com" \
+  --role="roles/pubsub.subscriber"
+```
+
+### How It Works
+
+1. **Retryable errors** (500s, timeouts): Pub/Sub retries up to `max-delivery-attempts` (5)
+2. **Non-retryable errors** (401, 403, 404): Function acknowledges immediately; message goes to DLQ after max attempts
+3. **Failed messages** include metadata: `CloudPubSubDeadLetterSourceDeliveryCount`, `CloudPubSubDeadLetterSourceSubscription`
+
+### Monitoring Failed Messages
+
+```bash
+# Pull messages from DLQ for inspection
+gcloud pubsub subscriptions pull pr-review-dlq-sub --limit=10 --auto-ack
+
+# View without acknowledging
+gcloud pubsub subscriptions pull pr-review-dlq-sub --limit=10
+```
+
+### Retry Behavior Summary
+
+| Error Type | HTTP Code | Retries | Final Destination |
+|------------|-----------|---------|-------------------|
+| Auth failure | 401, 403 | 0 (immediate fail) | DLQ |
+| Not found | 404 | 0 (immediate fail) | DLQ |
+| Server error | 500, 502, 503 | Up to 5 | DLQ if all fail |
+| Timeout | - | Up to 5 | DLQ if all fail |
+| Gemini error | - | Up to 3 (app-level) | Marked failed in GCS |
 
 ## Limitations
 
