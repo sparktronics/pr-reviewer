@@ -33,8 +33,11 @@ FUNCTION_NAME="pr-regression-review"
 REGION="us-central1"
 RUNTIME="python312"
 ENTRY_POINT="review_pr"
-MEMORY="512MB"
-TIMEOUT="300s"
+MEMORY="512Mi"
+CPU="1"
+TIMEOUT="900s"
+MAX_INSTANCES="60"
+CONCURRENCY="80"
 
 # =============================================================================
 # Helper Functions
@@ -120,7 +123,10 @@ echo "  Region: $REGION"
 echo "  Runtime: $RUNTIME"
 echo "  Entry Point: $ENTRY_POINT"
 echo "  Memory: $MEMORY"
+echo "  CPU: $CPU"
 echo "  Timeout: $TIMEOUT"
+echo "  Max Instances: $MAX_INSTANCES"
+echo "  Concurrency: $CONCURRENCY"
 echo ""
 
 print_info "Starting deployment..."
@@ -134,7 +140,10 @@ gcloud functions deploy "$FUNCTION_NAME" \
   --source=. \
   --entry-point="$ENTRY_POINT" \
   --memory="$MEMORY" \
+  --cpu="$CPU" \
   --timeout="$TIMEOUT" \
+  --max-instances="$MAX_INSTANCES" \
+  --concurrency="$CONCURRENCY" \
   --quiet
 
 # Check if deployment was successful
