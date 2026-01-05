@@ -289,6 +289,7 @@ curl -X POST https://REGION-PROJECT_ID.cloudfunctions.net/pr-regression-review \
 | `AZURE_DEVOPS_REPO` | Yes | Repository name or ID |
 | `VERTEX_PROJECT` | Yes | GCP project ID for Vertex AI |
 | `VERTEX_LOCATION` | No | GCP region (default: `us-central1`) |
+| `DLQ_SUBSCRIPTION` | No | Dead Letter Queue subscription name (default: `pr-review-dlq-sub`) |
 
 ## Azure DevOps PAT Permissions
 
@@ -393,9 +394,13 @@ The debugger configuration automatically:
 - **Network access**: Use `http://0.0.0.0:8080` to test from other devices on your network
 - **Stop server**: Press `Ctrl+C` in the terminal
 
-## Pub/Sub Dead Letter Queue (DLQ) Configuration
+## Dead Letter Queue (DLQ) Management
+
+### Overview
 
 For production deployments, configure a Dead Letter Queue to capture failed messages after retry attempts are exhausted. This prevents infinite retry loops and allows manual inspection of failures.
+
+### DLQ Configuration
 
 ### Step 1: Create Dead Letter Topic and Subscription
 
@@ -462,6 +467,81 @@ gcloud pubsub subscriptions pull pr-review-dlq-sub --limit=10
 | Server error | 500, 502, 503 | Up to 5 | DLQ if all fail |
 | Timeout | - | Up to 5 | DLQ if all fail |
 | Gemini error | - | Up to 3 (app-level) | Marked failed in GCS |
+
+### Processing Dead Letter Queue Messages
+
+After fixing issues that caused messages to be sent to the DLQ (e.g., renewing an expired PAT), you can reprocess those messages using the DLQ processing function.
+
+#### Deploy the DLQ Processing Function
+
+```bash
+gcloud functions deploy process-dead-letter-queue \
+  --gen2 \
+  --runtime=python312 \
+  --region=us-central1 \
+  --source=. \
+  --entry-point=process_dead_letter_queue \
+  --trigger-http \
+  --allow-unauthenticated \
+  --memory=256MB \
+  --timeout=540s \
+  --set-env-vars="GCS_BUCKET=rawl9001,AZURE_DEVOPS_ORG=batdigital,AZURE_DEVOPS_PROJECT=Consumer%20Platforms,AZURE_DEVOPS_REPO=AEM-Platform-Core,VERTEX_PROJECT=rawl-extractor,VERTEX_LOCATION=us-central1,PUBSUB_TOPIC=pr-review-trigger,DLQ_SUBSCRIPTION=pr-review-dlq-sub" \
+  --set-secrets="AZURE_DEVOPS_PAT=azure-devops-pat:latest,API_KEY=pr-review-api-key:latest"
+```
+
+#### Using the DLQ Processing Function
+
+The function validates credentials before processing and provides detailed reporting.
+
+**Dry Run (Preview what would be reprocessed):**
+```bash
+curl -X POST "$(gcloud functions describe process-dead-letter-queue --region=us-central1 --format='value(serviceConfig.uri)')" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -d '{"max_messages": 10, "dry_run": true}'
+```
+
+**Process Messages:**
+```bash
+curl -X POST "$(gcloud functions describe process-dead-letter-queue --region=us-central1 --format='value(serviceConfig.uri)')" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -d '{"max_messages": 100}'
+```
+
+**Response:**
+```json
+{
+  "status": "completed",
+  "messages_pulled": 5,
+  "messages_republished": 5,
+  "messages_failed": 0,
+  "dry_run": false,
+  "details": [
+    {
+      "pr_id": 12345,
+      "commit_sha": "abc123de",
+      "status": "republished",
+      "new_message_id": "987654321"
+    }
+  ]
+}
+```
+
+#### How It Works
+
+1. **Validates Credentials**: Tests Azure DevOps PAT before processing to ensure it's working
+2. **Pulls Messages**: Retrieves messages from the DLQ subscription (up to `max_messages`)
+3. **Resets Idempotency**: Deletes idempotency markers to allow reprocessing
+4. **Republishes**: Sends messages back to the main `pr-review-trigger` topic for processing
+5. **Acknowledges**: Removes successfully processed messages from the DLQ
+
+#### Best Practices
+
+- Always run with `dry_run: true` first to preview what will be reprocessed
+- Process in batches (e.g., 10-100 messages at a time) for large DLQs
+- Monitor the main processing function logs after reprocessing to verify success
+- If messages continue to fail, investigate root cause before reprocessing more
 
 ## Limitations
 
