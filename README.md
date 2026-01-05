@@ -81,7 +81,21 @@ gcloud secrets add-iam-policy-binding pr-review-api-key \
 gcloud storage buckets create gs://YOUR_BUCKET_NAME --location=us-central1
 ```
 
-### Step 5: Deploy Cloud Function
+### Step 5: Create Pub/Sub Topic
+
+```bash
+# Create the topic for PR review triggers
+gcloud pubsub topics create pr-review-trigger
+
+# Verify
+gcloud pubsub topics list | grep pr-review
+```
+
+### Step 6: Deploy Cloud Functions
+
+#### Option A: HTTP Function (Synchronous)
+
+For direct HTTP calls (testing, manual triggers):
 
 ```bash
 gcloud functions deploy pr-regression-review \
@@ -98,7 +112,46 @@ gcloud functions deploy pr-regression-review \
   --set-secrets="AZURE_DEVOPS_PAT=azure-devops-pat:latest,API_KEY=pr-review-api-key:latest"
 ```
 
-### Step 6: Verify Deployment
+#### Option B: Pub/Sub Function (Asynchronous - Recommended for Production)
+
+For async processing via Pub/Sub (with idempotency and retry handling):
+
+```bash
+gcloud functions deploy pr-review-pubsub \
+  --gen2 \
+  --runtime=python312 \
+  --region=us-central1 \
+  --source=. \
+  --entry-point=review_pr_pubsub \
+  --trigger-topic=pr-review-trigger \
+  --memory=512MB \
+  --timeout=300s \
+  --set-env-vars="GCS_BUCKET=rawl9001,AZURE_DEVOPS_ORG=batdigital,AZURE_DEVOPS_PROJECT=Consumer%20Platforms,AZURE_DEVOPS_REPO=AEM-Platform-Core,VERTEX_PROJECT=rawl-extractor,VERTEX_LOCATION=us-central1" \
+  --set-secrets="AZURE_DEVOPS_PAT=azure-devops-pat:latest,API_KEY=pr-review-api-key:latest"
+```
+
+#### Option C: Webhook Receiver (For Azure DevOps Pipeline Integration)
+
+Receives webhooks and publishes to Pub/Sub for async processing:
+
+```bash
+gcloud functions deploy pr-review-webhook \
+  --gen2 \
+  --runtime=python312 \
+  --region=us-central1 \
+  --source=. \
+  --entry-point=receive_webhook \
+  --trigger-http \
+  --allow-unauthenticated \
+  --memory=256MB \
+  --timeout=30s \
+  --set-env-vars="VERTEX_PROJECT=rawl-extractor,PUBSUB_TOPIC=pr-review-trigger" \
+  --set-secrets="API_KEY=pr-review-api-key:latest"
+```
+
+### Step 7: Verify Deployment
+
+#### Verify HTTP Function
 
 ```bash
 # Get the function URL
@@ -109,6 +162,31 @@ curl -X POST "$(gcloud functions describe pr-regression-review --region=us-centr
   -H "Content-Type: application/json" \
   -H "X-API-Key: YOUR_API_KEY" \
   -d '{"pr_id": 12345}'
+```
+
+#### Verify Pub/Sub Function
+
+```bash
+# Publish a test message
+gcloud pubsub topics publish pr-review-trigger \
+  --project=rawl-extractor \
+  --message='{"pr_id": 12345, "commit_sha": "abc123def456789", "source": "manual-test"}'
+
+# Check function logs
+gcloud functions logs read pr-review-pubsub --region=us-central1 --limit=50
+```
+
+#### Verify Webhook Function
+
+```bash
+# Get webhook URL
+WEBHOOK_URL=$(gcloud functions describe pr-review-webhook --region=us-central1 --format='value(serviceConfig.uri)')
+
+# Test webhook
+curl -X POST "$WEBHOOK_URL" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -d '{"pr_id": 12345, "commit_sha": "abc123def456789"}'
 ```
 
 ### Redeploying After Changes
@@ -144,12 +222,29 @@ chmod +x deploy.sh
 If you prefer to deploy manually or need to override specific settings:
 
 ```bash
+# HTTP function
 gcloud functions deploy pr-regression-review \
   --gen2 \
   --runtime=python312 \
   --region=us-central1 \
   --source=. \
   --entry-point=review_pr
+
+# Pub/Sub function
+gcloud functions deploy pr-review-pubsub \
+  --gen2 \
+  --runtime=python312 \
+  --region=us-central1 \
+  --source=. \
+  --entry-point=review_pr_pubsub
+
+# Webhook function
+gcloud functions deploy pr-review-webhook \
+  --gen2 \
+  --runtime=python312 \
+  --region=us-central1 \
+  --source=. \
+  --entry-point=receive_webhook
 ```
 
 > **Note:** Environment variables and secrets persist between deployments unless explicitly changed. The deployment script reuses all existing configuration automatically.
