@@ -361,7 +361,7 @@ gcloud functions deploy process-dead-letter-queue \
   --allow-unauthenticated \
   --memory=256MB \
   --timeout=540s \
-  --set-env-vars="GCS_BUCKET=rawl9001,AZURE_DEVOPS_ORG=batdigital,AZURE_DEVOPS_PROJECT=Consumer%20Platforms,AZURE_DEVOPS_REPO=AEM-Platform-Core,VERTEX_PROJECT=rawl-extractor,VERTEX_LOCATION=us-central1,PUBSUB_TOPIC=pr-review-trigger" \
+  --set-env-vars="GCS_BUCKET=rawl9001,AZURE_DEVOPS_ORG=batdigital,AZURE_DEVOPS_PROJECT=Consumer%20Platforms,AZURE_DEVOPS_REPO=AEM-Platform-Core,VERTEX_PROJECT=rawl-extractor,VERTEX_LOCATION=us-central1,PUBSUB_TOPIC=pr-review-trigger,DLQ_SUBSCRIPTION=pr-review-dlq-sub" \
   --set-secrets="AZURE_DEVOPS_PAT=azure-devops-pat:latest,API_KEY=pr-review-api-key:latest"
 ```
 

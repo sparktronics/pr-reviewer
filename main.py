@@ -1308,7 +1308,7 @@ def process_dead_letter_queue(request):
         subscriber = pubsub_v1.SubscriberClient()
         dlq_subscription_path = subscriber.subscription_path(
             config["VERTEX_PROJECT"],
-            "pr-review-dlq-sub"
+            config.get("DLQ_SUBSCRIPTION", "pr-review-dlq-sub")
         )
 
         try:
@@ -1360,6 +1360,8 @@ def process_dead_letter_queue(request):
         bucket = storage_client.bucket(config["GCS_BUCKET"])
 
         for received_message in response.received_messages:
+            pr_id = None
+            commit_sha = None
             try:
                 # Decode message
                 message_data = json.loads(received_message.message.data.decode("utf-8"))
@@ -1369,13 +1371,14 @@ def process_dead_letter_queue(request):
                 logger.info(f"[DLQ] Processing PR #{pr_id} @ {commit_sha[:8] if commit_sha else 'unknown'}")
 
                 if not pr_id:
-                    logger.warning(f"[DLQ] Skipping message with missing pr_id")
+                    logger.warning(f"[DLQ] Skipping message with missing pr_id (will acknowledge to clear from DLQ)")
                     details.append({
                         "pr_id": None,
                         "status": "skipped",
                         "reason": "missing pr_id"
                     })
                     messages_failed += 1
+                    ack_ids.append(received_message.ack_id)
                     continue
 
                 if dry_run:
@@ -1387,6 +1390,7 @@ def process_dead_letter_queue(request):
                         "action": "would republish"
                     })
                     messages_republished += 1
+                    # Tracked but won't actually ack - the ack block checks dry_run
                     ack_ids.append(received_message.ack_id)
                     continue
 
@@ -1428,7 +1432,7 @@ def process_dead_letter_queue(request):
             except Exception as e:
                 logger.error(f"[DLQ] Failed to process message: {e}")
                 details.append({
-                    "pr_id": pr_id if 'pr_id' in locals() else None,
+                    "pr_id": pr_id,
                     "status": "failed",
                     "error": str(e)
                 })
