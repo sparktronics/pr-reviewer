@@ -1,4 +1,6 @@
-# RAWL 9001 POC - PR Regression Review
+# RAWL 9001 POC - PR Regression Review System
+
+This is RAWL 9001 - the Review Agent With Learning. "I'm sorry, Dave. I can't let you merge that."
 
 A Cloud Function that fetches Pull Requests from Azure DevOps, sends them to Gemini (Vertex AI) for regression-focused review of AEM frontend components, and automatically comments or rejects PRs based on severity.
 
@@ -289,6 +291,7 @@ curl -X POST https://REGION-PROJECT_ID.cloudfunctions.net/pr-regression-review \
 | `AZURE_DEVOPS_REPO` | Yes | Repository name or ID |
 | `VERTEX_PROJECT` | Yes | GCP project ID for Vertex AI |
 | `VERTEX_LOCATION` | No | GCP region (default: `us-central1`) |
+| `GEMINI_MODEL` | No | Gemini model to use (default: `gemini-2.5-pro`) |
 | `DLQ_SUBSCRIPTION` | No | Dead Letter Queue subscription name (default: `pr-review-dlq-sub`) |
 
 ## Azure DevOps PAT Permissions
