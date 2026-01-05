@@ -102,8 +102,9 @@ def load_config() -> tuple[dict, list]:
             missing.append(var)
         config[var] = value
     
-    # Optional with default
+    # Optional with defaults
     config["VERTEX_LOCATION"] = os.environ.get("VERTEX_LOCATION", "us-central1")
+    config["DLQ_SUBSCRIPTION"] = os.environ.get("DLQ_SUBSCRIPTION", "pr-review-dlq-sub")
     
     return config, missing
 
@@ -1296,11 +1297,17 @@ def process_dead_letter_queue(request):
             user_id = ado.get_current_user_id()
             logger.info(f"[DLQ] Credentials validated successfully (user: {user_id[:8]}...)")
         except requests.HTTPError as e:
-            logger.error(f"[DLQ] Credential validation FAILED: {e.response.status_code}")
+            status_code = e.response.status_code if e.response else 500
+            logger.error(f"[DLQ] Credential validation FAILED: {status_code}")
             return make_response({
                 "error": "Azure DevOps credentials validation failed. Please check your PAT.",
-                "status_code": e.response.status_code
+                "status_code": status_code
             }, 401)
+        except requests.RequestException as e:
+            logger.error(f"[DLQ] Credential validation error: {str(e)}")
+            return make_response({
+                "error": f"Failed to validate credentials: {str(e)}"
+            }, 500)
 
         # Step 2: Pull messages from DLQ
         logger.info(f"[DLQ] Step 2/3: Pulling up to {max_messages} messages from DLQ")

@@ -166,6 +166,7 @@ curl -X POST https://REGION-PROJECT_ID.cloudfunctions.net/pr-regression-review \
 | `AZURE_DEVOPS_REPO` | Yes | Repository name or ID |
 | `VERTEX_PROJECT` | Yes | GCP project ID for Vertex AI |
 | `VERTEX_LOCATION` | No | GCP region (default: `us-central1`) |
+| `DLQ_SUBSCRIPTION` | No | Dead Letter Queue subscription name (default: `pr-review-dlq-sub`) |
 
 ## Azure DevOps PAT Permissions
 
