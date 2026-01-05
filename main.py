@@ -1217,23 +1217,267 @@ def load_webhook_config() -> tuple[dict, list]:
 
 
 @functions_framework.http
-def receive_webhook(request):
+def process_dead_letter_queue(request):
     """
-    HTTP webhook receiver for Azure DevOps pipeline.
-    
-    Validates the request and publishes a message to Pub/Sub for async processing.
-    This decouples the webhook acknowledgment from the actual PR review processing.
-    
+    HTTP-triggered function to process messages from the Dead Letter Queue.
+
+    This function should be called manually after resolving issues that caused
+    messages to be sent to the DLQ (e.g., after renewing an expired PAT).
+
+    It will:
+    1. Validate Azure DevOps credentials before processing
+    2. Pull messages from the DLQ subscription
+    3. Reset idempotency markers to allow reprocessing
+    4. Republish messages to the main processing topic
+
     Request Format:
         POST /
         Content-Type: application/json
         X-API-Key: <api-key>
-        
+
+        {
+            "max_messages": 10,  // Optional: max messages to process (default: 100)
+            "dry_run": false     // Optional: if true, only report what would be done
+        }
+
+    Response (200 OK):
+        {
+            "status": "completed",
+            "messages_pulled": 5,
+            "messages_republished": 5,
+            "messages_failed": 0,
+            "dry_run": false,
+            "details": [...]
+        }
+    """
+    with timed_operation() as elapsed:
+        logger.info("=" * 60)
+        logger.info("[DLQ] Dead Letter Queue processing function invoked")
+
+        # Load config
+        config, missing = load_config()
+        if missing:
+            logger.error(f"[CONFIG] Missing required environment variables: {missing}")
+            return make_response({"error": f"Missing config: {', '.join(missing)}"}, 500)
+
+        # Validate API key
+        api_key = request.headers.get("X-API-Key")
+        if not api_key or api_key != config["API_KEY"]:
+            logger.warning("[AUTH] Invalid or missing API key")
+            return make_response({"error": "Invalid or missing API key"}, 401)
+
+        logger.info("[AUTH] API key validated")
+
+        # Parse request parameters
+        request_json = request.get_json(silent=True) or {}
+        max_messages = request_json.get("max_messages", 100)
+        dry_run = request_json.get("dry_run", False)
+
+        try:
+            max_messages = int(max_messages)
+            if max_messages < 1 or max_messages > 1000:
+                return make_response({"error": "max_messages must be between 1 and 1000"}, 400)
+        except (ValueError, TypeError):
+            return make_response({"error": "max_messages must be an integer"}, 400)
+
+        logger.info(f"[DLQ] Processing parameters: max_messages={max_messages}, dry_run={dry_run}")
+
+        # Step 1: Validate Azure DevOps credentials before processing
+        logger.info("[DLQ] Step 1/3: Validating Azure DevOps credentials")
+        ado = AzureDevOpsClient(
+            org=config["AZURE_DEVOPS_ORG"],
+            project=config["AZURE_DEVOPS_PROJECT"],
+            repo=config["AZURE_DEVOPS_REPO"],
+            pat=config["AZURE_DEVOPS_PAT"],
+        )
+
+        try:
+            # Test credentials by getting current user
+            user_id = ado.get_current_user_id()
+            logger.info(f"[DLQ] Credentials validated successfully (user: {user_id[:8]}...)")
+        except requests.HTTPError as e:
+            logger.error(f"[DLQ] Credential validation FAILED: {e.response.status_code}")
+            return make_response({
+                "error": "Azure DevOps credentials validation failed. Please check your PAT.",
+                "status_code": e.response.status_code
+            }, 401)
+
+        # Step 2: Pull messages from DLQ
+        logger.info(f"[DLQ] Step 2/3: Pulling up to {max_messages} messages from DLQ")
+
+        subscriber = pubsub_v1.SubscriberClient()
+        dlq_subscription_path = subscriber.subscription_path(
+            config["VERTEX_PROJECT"],
+            "pr-review-dlq-sub"
+        )
+
+        try:
+            with timed_operation() as pull_elapsed:
+                response = subscriber.pull(
+                    request={
+                        "subscription": dlq_subscription_path,
+                        "max_messages": max_messages,
+                    },
+                    timeout=30,
+                )
+
+            messages_pulled = len(response.received_messages)
+            logger.info(f"[DLQ] Pulled {messages_pulled} messages from DLQ | {pull_elapsed():.0f}ms")
+
+        except Exception as e:
+            logger.error(f"[DLQ] Failed to pull messages from DLQ: {e}")
+            return make_response({
+                "error": f"Failed to pull from DLQ: {str(e)}"
+            }, 500)
+
+        if messages_pulled == 0:
+            logger.info(f"[DLQ] No messages in DLQ | {elapsed():.0f}ms")
+            logger.info("=" * 60)
+            return make_response({
+                "status": "completed",
+                "messages_pulled": 0,
+                "messages_republished": 0,
+                "messages_failed": 0,
+                "dry_run": dry_run,
+                "message": "No messages found in DLQ"
+            })
+
+        # Step 3: Process and republish messages
+        logger.info(f"[DLQ] Step 3/3: Processing {messages_pulled} messages")
+
+        publisher = pubsub_v1.PublisherClient()
+        main_topic_path = publisher.topic_path(
+            config["VERTEX_PROJECT"],
+            config.get("PUBSUB_TOPIC", "pr-review-trigger")
+        )
+
+        messages_republished = 0
+        messages_failed = 0
+        details = []
+        ack_ids = []
+
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(config["GCS_BUCKET"])
+
+        for received_message in response.received_messages:
+            try:
+                # Decode message
+                message_data = json.loads(received_message.message.data.decode("utf-8"))
+                pr_id = message_data.get("pr_id")
+                commit_sha = message_data.get("commit_sha")
+
+                logger.info(f"[DLQ] Processing PR #{pr_id} @ {commit_sha[:8] if commit_sha else 'unknown'}")
+
+                if not pr_id:
+                    logger.warning(f"[DLQ] Skipping message with missing pr_id")
+                    details.append({
+                        "pr_id": None,
+                        "status": "skipped",
+                        "reason": "missing pr_id"
+                    })
+                    messages_failed += 1
+                    continue
+
+                if dry_run:
+                    logger.info(f"[DLQ] DRY RUN: Would republish PR #{pr_id}")
+                    details.append({
+                        "pr_id": pr_id,
+                        "commit_sha": commit_sha[:8] if commit_sha else None,
+                        "status": "dry_run",
+                        "action": "would republish"
+                    })
+                    messages_republished += 1
+                    ack_ids.append(received_message.ack_id)
+                    continue
+
+                # Reset idempotency marker if commit_sha is available
+                if commit_sha:
+                    marker_blob = bucket.blob(f"idempotency/pr-{pr_id}-{commit_sha}.json")
+                    if marker_blob.exists():
+                        logger.info(f"[DLQ] Deleting idempotency marker for PR #{pr_id} @ {commit_sha[:8]}")
+                        marker_blob.delete()
+
+                # Republish to main topic
+                republish_message = {
+                    "pr_id": pr_id,
+                    "commit_sha": commit_sha,
+                    "received_at": datetime.now(timezone.utc).isoformat(),
+                    "source": "dlq-reprocessing",
+                    "original_message_id": received_message.message.message_id
+                }
+
+                with timed_operation() as pub_elapsed:
+                    future = publisher.publish(
+                        main_topic_path,
+                        json.dumps(republish_message).encode("utf-8")
+                    )
+                    new_message_id = future.result(timeout=10)
+
+                logger.info(f"[DLQ] Republished PR #{pr_id} | new message_id={new_message_id} | {pub_elapsed():.0f}ms")
+
+                details.append({
+                    "pr_id": pr_id,
+                    "commit_sha": commit_sha[:8] if commit_sha else None,
+                    "status": "republished",
+                    "new_message_id": new_message_id
+                })
+
+                messages_republished += 1
+                ack_ids.append(received_message.ack_id)
+
+            except Exception as e:
+                logger.error(f"[DLQ] Failed to process message: {e}")
+                details.append({
+                    "pr_id": pr_id if 'pr_id' in locals() else None,
+                    "status": "failed",
+                    "error": str(e)
+                })
+                messages_failed += 1
+
+        # Acknowledge successfully processed messages
+        if ack_ids and not dry_run:
+            try:
+                subscriber.acknowledge(
+                    request={
+                        "subscription": dlq_subscription_path,
+                        "ack_ids": ack_ids,
+                    }
+                )
+                logger.info(f"[DLQ] Acknowledged {len(ack_ids)} messages")
+            except Exception as e:
+                logger.error(f"[DLQ] Failed to acknowledge messages: {e}")
+
+        logger.info(f"[COMPLETE] DLQ processing finished | Pulled: {messages_pulled} | Republished: {messages_republished} | Failed: {messages_failed} | {elapsed():.0f}ms")
+        logger.info("=" * 60)
+
+        return make_response({
+            "status": "completed",
+            "messages_pulled": messages_pulled,
+            "messages_republished": messages_republished,
+            "messages_failed": messages_failed,
+            "dry_run": dry_run,
+            "details": details
+        })
+
+
+@functions_framework.http
+def receive_webhook(request):
+    """
+    HTTP webhook receiver for Azure DevOps pipeline.
+
+    Validates the request and publishes a message to Pub/Sub for async processing.
+    This decouples the webhook acknowledgment from the actual PR review processing.
+
+    Request Format:
+        POST /
+        Content-Type: application/json
+        X-API-Key: <api-key>
+
         {
             "pr_id": 357462,
             "commit_sha": "abc123def456789..."
         }
-    
+
     Response (202 Accepted):
         {
             "status": "queued",
