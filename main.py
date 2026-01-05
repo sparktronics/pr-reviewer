@@ -105,6 +105,7 @@ def load_config() -> tuple[dict, list]:
     # Optional with defaults
     config["VERTEX_LOCATION"] = os.environ.get("VERTEX_LOCATION", "us-central1")
     config["DLQ_SUBSCRIPTION"] = os.environ.get("DLQ_SUBSCRIPTION", "pr-review-dlq-sub")
+    config["GEMINI_MODEL"] = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
     
     return config, missing
 
@@ -617,14 +618,15 @@ def get_max_severity(review: str) -> str:
 # Gemini Review Prompt
 # =============================================================================
 
-SYSTEM_PROMPT = """You are a senior AEM frontend developer conducting a regression-focused code review.
+SYSTEM_PROMPT = """You are a very detailed senior AEM frontend developer conducting a regression-focused code review. You are also a senior QA engineer and accessibility expert.
 
 Your expertise covers:
 - AEM 6.5 components and dialogs
 - HTL (Sightly) templating
 - Vanilla JavaScript (no frameworks)
 - CSS styling
-- HTML structure accessibility 
+- HTML structure 
+- Web Content Accessibility Guidelines 2.2 
 
 ## Review Focus: Regression Testing for AEM Frontend Components
 
@@ -667,7 +669,7 @@ List changes that could cause issues depending on usage. Include:
 List changes that are unlikely to cause regressions but warrant awareness.
 
 ## Recommended Test Coverage
-Specific test scenarios that should be validated before merge:
+Specific test scenarios that should be validated before merge (focus on accessibility and regression testing):
 1. {scenario with expected behavior}
 2. {scenario with expected behavior}
 ...
@@ -697,16 +699,24 @@ For each significant finding, use this format:
 #### Why This Matters
 {Brief explanation for junior developers}
 
+#### Proposed Fix
+{Brief explanation of the proposed fix. Choose the simplest fix.}
+```{language}
+{proposed fix}
+``` 
+
+
 ---
 
 ## Guidelines
 
 - Be specific about file paths and line references
-- Prioritize findings by regression risk, not code style
+- Prioritize findings by regression risk, not code style. Make sure no breaking changes are missed.
 - Focus on what could break in production, not cosmetic issues
 - If no significant risks found, say so clearly
 - Keep the report under 200 lines total
 - Do not invent issues - only report actual concerns from the diff
+- Be succinct and to the point. Don't be verbose.
 """
 
 
@@ -760,7 +770,7 @@ def build_review_prompt(pr: dict, file_diffs: list) -> str:
 def call_gemini(config: dict, prompt: str) -> str:
     """Send prompt to Gemini via Vertex AI and return response."""
     
-    model_name = "gemini-2.5-pro"
+    model_name = config["GEMINI_MODEL"]
     project = config["VERTEX_PROJECT"]
     location = config["VERTEX_LOCATION"]
     
@@ -931,9 +941,9 @@ def review_pr(request):
             if has_blocking or has_warning:
                 logger.info(f"[ACTION] Posting review comment to PR #{pr_id}")
                 # Post comment with full review
-                comment_header = "##  Automated Regression Review\n\n"
+                comment_header = "## RAWL9001 - Automated Regression Review\n\n"
                 if has_blocking:
-                    comment_header += "⛔ **Sorry Dave, I can't merge you this time. This PR has been automatically rejected due to blocking issues.**\n\n"
+                    comment_header += f"⛔ **Sorry Dave('{pr_author}'), I can't let you merge this time. This PR has been automatically rejected due to blocking issues.**\n\n"
                 else:
                     comment_header += "⚠️ **Warning: This PR has potential issues that should be reviewed.**\n\n"
                 
