@@ -113,7 +113,35 @@ curl -X POST "$(gcloud functions describe pr-regression-review --region=us-centr
 
 ### Redeploying After Changes
 
-After modifying `main.py`, redeploy with:
+After modifying the cloud function code (e.g., `main.py`, `requirements.txt`), you can quickly redeploy using the deployment script:
+
+#### Option 1: Using the Deployment Script (Recommended)
+
+The `deploy.sh` script automates the deployment process with built-in validation:
+
+```bash
+./deploy.sh
+```
+
+The script will:
+- ✅ Verify gcloud authentication and project configuration
+- ✅ Check that required files exist (main.py, requirements.txt)
+- ✅ Deploy the function with existing environment variables and secrets
+- ✅ Display the function URL and useful commands
+
+**Prerequisites:**
+- gcloud CLI installed and authenticated (`gcloud auth login`)
+- GCP project configured (`gcloud config set project YOUR_PROJECT_ID`)
+- Initial setup completed (secrets, storage bucket, APIs enabled - see steps 1-4 above)
+
+**Make the script executable (first time only):**
+```bash
+chmod +x deploy.sh
+```
+
+#### Option 2: Manual Deployment
+
+If you prefer to deploy manually or need to override specific settings:
 
 ```bash
 gcloud functions deploy pr-regression-review \
@@ -124,7 +152,7 @@ gcloud functions deploy pr-regression-review \
   --entry-point=review_pr
 ```
 
-> **Note:** Environment variables and secrets persist between deployments unless explicitly changed.
+> **Note:** Environment variables and secrets persist between deployments unless explicitly changed. The deployment script reuses all existing configuration automatically.
 
 ## Usage
 
