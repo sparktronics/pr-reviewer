@@ -4,10 +4,16 @@
 
 ### General
 - Follow PEP 8 conventions, prioritizing readability
+- As an experienced developer, follow good practices: don't repeat yourself DRY, Single Responsibility, and You-Aint-Going-To-Use-It
+- Always wait for human approval before implementing any phase
+- Help in reading and investigating existing code base
+- Always update the markdown file when implementation phases are completed after approval from human
 - Use type hints for function signatures and class attributes
 - Prefer f-strings over `.format()` or `%` formatting
 - Use meaningful variable names; avoid single letters except for loops/lambdas
 - Keep functions focused; aim for under 50 lines when practical
+- Always update tests and documentation after a successful implementation fase
+- Consider performance when implementing
 
 ### Naming
 - Use `snake_case` for functions, variables, modules
