@@ -29,6 +29,7 @@ import logging
 import time
 import requests
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import base64
@@ -820,6 +821,125 @@ def call_gemini(config: dict, prompt: str) -> str:
 
 
 # =============================================================================
+# Core Review Logic (Shared by HTTP and Pub/Sub Entry Points)
+# =============================================================================
+
+@dataclass
+class ReviewResult:
+    """Result of processing a PR review."""
+    pr_id: int
+    pr_title: str
+    pr_author: str
+    files_changed: int
+    max_severity: str  # "blocking", "warning", or "info"
+    has_blocking: bool
+    has_warning: bool
+    review_text: str
+    storage_path: str
+    commented: bool
+    action_taken: str | None  # "rejected", "commented", or None
+
+
+def process_pr_review(
+    config: dict,
+    ado: "AzureDevOpsClient",
+    pr_id: int,
+    pr: dict,
+    file_diffs: list,
+) -> ReviewResult:
+    """
+    Core PR review logic shared by HTTP and Pub/Sub entry points.
+    
+    This function handles:
+    1. Building the review prompt
+    2. Calling Gemini for analysis
+    3. Determining severity
+    4. Saving review to Cloud Storage
+    5. Posting comments and/or rejecting PR based on severity
+    
+    Args:
+        config: Configuration dictionary with GCS_BUCKET etc.
+        ado: Initialized AzureDevOpsClient instance
+        pr_id: Pull Request ID
+        pr: PR metadata dict from Azure DevOps
+        file_diffs: List of file diff dicts
+        
+    Returns:
+        ReviewResult with all review details and actions taken
+    """
+    pr_title = pr.get("title", "Untitled")
+    pr_author = pr.get("createdBy", {}).get("displayName", "Unknown")
+    
+    logger.info(f"[REVIEW] Starting review for PR #{pr_id}: '{pr_title}' by {pr_author}")
+    logger.info(f"[REVIEW] Files to review: {len(file_diffs)}")
+    
+    # Build prompt and call Gemini
+    logger.info("[REVIEW] Building prompt and calling Gemini")
+    prompt = build_review_prompt(pr, file_diffs)
+    logger.info(f"[REVIEW] Prompt built: {len(prompt)} chars")
+    
+    review = call_gemini(config, prompt)
+    
+    # Determine severity
+    logger.info("[REVIEW] Analyzing severity")
+    max_severity = get_max_severity(review)
+    has_blocking = max_severity == "blocking"
+    has_warning = max_severity == "warning"
+    logger.info(f"[REVIEW] Severity: {max_severity.upper()} | blocking={has_blocking} | warning={has_warning}")
+    
+    # Save to Cloud Storage
+    logger.info("[REVIEW] Saving to Cloud Storage")
+    storage_path = save_to_storage(config["GCS_BUCKET"], pr_id, review)
+    
+    # Take action based on severity
+    commented = False
+    action_taken = None
+    
+    if has_blocking or has_warning:
+        logger.info(f"[ACTION] Posting review comment to PR #{pr_id}")
+        
+        # Build comment with standard header
+        comment_header = "## RAWL9001 - Automated Regression Review\n\n"
+        if has_blocking:
+            comment_header += f"⛔ **Sorry Dave('{pr_author}'), I can't let you merge this time. This PR has been automatically rejected due to blocking issues.**\n\n"
+        else:
+            comment_header += "⚠️ **Warning: This PR has potential issues that should be reviewed.**\n\n"
+        
+        comment_header += f"📁 Full review saved to: `{storage_path}`\n\n---\n\n"
+        
+        ado.post_pr_comment(pr_id, comment_header + review)
+        commented = True
+        logger.info("[ACTION] Comment posted successfully")
+        
+        if has_blocking:
+            logger.info("[ACTION] Rejecting PR due to blocking issues")
+            user_id = ado.get_current_user_id()
+            ado.reject_pr(pr_id, user_id)
+            action_taken = "rejected"
+            logger.info(f"[ACTION] PR #{pr_id} rejected")
+        else:
+            action_taken = "commented"
+    else:
+        logger.info("[ACTION] No issues found - no action taken on PR")
+    
+    logger.info(f"[REVIEW] Complete | Severity: {max_severity} | Action: {action_taken or 'none'}")
+    
+    return ReviewResult(
+        pr_id=pr_id,
+        pr_title=pr_title,
+        pr_author=pr_author,
+        files_changed=len(file_diffs),
+        max_severity=max_severity,
+        has_blocking=has_blocking,
+        has_warning=has_warning,
+        review_text=review,
+        storage_path=storage_path,
+        commented=commented,
+        action_taken=action_taken,
+    )
+
+
+# =============================================================================
 # HTTP Cloud Function Entry Point
 # =============================================================================
 
@@ -889,14 +1009,14 @@ def review_pr(request):
         
         try:
             # Fetch PR data
-            logger.info(f"[FLOW] Step 1/5: Fetching PR metadata")
+            logger.info(f"[FLOW] Step 1/3: Fetching PR metadata")
             pr = ado.get_pull_request(pr_id)
             pr_title = pr.get("title", "Untitled")
             pr_author = pr.get("createdBy", {}).get("displayName", "Unknown")
             logger.info(f"[FLOW] PR: '{pr_title}' by {pr_author}")
             
             # Fetch file diffs
-            logger.info(f"[FLOW] Step 2/5: Fetching file diffs")
+            logger.info(f"[FLOW] Step 2/3: Fetching file diffs")
             file_diffs = ado.get_pr_diff(pr_id)
             
             if not file_diffs:
@@ -916,69 +1036,24 @@ def review_pr(request):
             for diff in file_diffs:
                 logger.debug(f"[FLOW]   - {diff['path']} ({diff['change_type']})")
             
-            # Build prompt and call Gemini
-            logger.info(f"[FLOW] Step 3/5: Building prompt and calling Gemini")
-            prompt = build_review_prompt(pr, file_diffs)
-            logger.info(f"[FLOW] Prompt built: {len(prompt)} chars")
+            # Process the review using shared logic
+            logger.info(f"[FLOW] Step 3/3: Processing review")
+            result = process_pr_review(config, ado, pr_id, pr, file_diffs)
             
-            review = call_gemini(config, prompt)
-            
-            # Determine severity
-            logger.info(f"[FLOW] Step 4/5: Analyzing severity")
-            max_severity = get_max_severity(review)
-            has_blocking = max_severity == "blocking"
-            has_warning = max_severity == "warning"
-            logger.info(f"[FLOW] Severity assessment: {max_severity.upper()} | blocking={has_blocking} | warning={has_warning}")
-            
-            # Save to Cloud Storage
-            logger.info(f"[FLOW] Step 5/5: Saving to Cloud Storage")
-            storage_path = save_to_storage(config["GCS_BUCKET"], pr_id, review)
-            
-            # Take action based on severity
-            commented = False
-            action_taken = None
-            
-            if has_blocking or has_warning:
-                logger.info(f"[ACTION] Posting review comment to PR #{pr_id}")
-                # Post comment with full review
-                comment_header = "## RAWL9001 - Automated Regression Review\n\n"
-                if has_blocking:
-                    comment_header += f"⛔ **Sorry Dave('{pr_author}'), I can't let you merge this time. This PR has been automatically rejected due to blocking issues.**\n\n"
-                else:
-                    comment_header += "⚠️ **Warning: This PR has potential issues that should be reviewed.**\n\n"
-                
-                comment_header += f"📁 Full review saved to: `{storage_path}`\n\n---\n\n"
-                
-                ado.post_pr_comment(pr_id, comment_header + review)
-                commented = True
-                logger.info(f"[ACTION] Comment posted successfully")
-                
-                if has_blocking:
-                    # Reject the PR
-                    logger.info(f"[ACTION] Rejecting PR due to blocking issues")
-                    user_id = ado.get_current_user_id()
-                    ado.reject_pr(pr_id, user_id)
-                    action_taken = "rejected"
-                    logger.info(f"[ACTION] PR #{pr_id} rejected")
-                else:
-                    action_taken = "commented"
-            else:
-                logger.info(f"[ACTION] No issues found - no action taken on PR")
-            
-            logger.info(f"[COMPLETE] PR #{pr_id} review finished | Severity: {max_severity} | Action: {action_taken or 'none'} | Total time: {elapsed():.0f}ms")
+            logger.info(f"[COMPLETE] PR #{pr_id} review finished | Severity: {result.max_severity} | Action: {result.action_taken or 'none'} | Total time: {elapsed():.0f}ms")
             logger.info("=" * 60)
             
             return make_response({
-                "pr_id": pr_id,
-                "title": pr_title,
-                "files_changed": len(file_diffs),
-                "max_severity": max_severity,
-                "has_blocking": has_blocking,
-                "has_warning": has_warning,
-                "action_taken": action_taken,
-                "commented": commented,
-                "storage_path": storage_path,
-                "review_preview": review[:500] + "..." if len(review) > 500 else review,
+                "pr_id": result.pr_id,
+                "title": result.pr_title,
+                "files_changed": result.files_changed,
+                "max_severity": result.max_severity,
+                "has_blocking": result.has_blocking,
+                "has_warning": result.has_warning,
+                "action_taken": result.action_taken,
+                "commented": result.commented,
+                "storage_path": result.storage_path,
+                "review_preview": result.review_text[:500] + "..." if len(result.review_text) > 500 else result.review_text,
             })
             
         except requests.HTTPError as e:
@@ -1073,7 +1148,7 @@ def review_pr_pubsub(cloud_event: CloudEvent) -> None:
         
         try:
             # Fetch PR metadata
-            logger.info(f"[FLOW] Step 1/6: Fetching PR metadata")
+            logger.info(f"[FLOW] Step 1/4: Fetching PR metadata")
             pr = ado.get_pull_request(pr_id)
             pr_title = pr.get("title", "Untitled")
             pr_author = pr.get("createdBy", {}).get("displayName", "Unknown")
@@ -1094,7 +1169,7 @@ def review_pr_pubsub(cloud_event: CloudEvent) -> None:
             logger.info(f"[FLOW] PR: '{pr_title}' by {pr_author} @ commit {commit_sha[:8]}")
             
             # Idempotency check
-            logger.info(f"[FLOW] Step 2/6: Checking idempotency")
+            logger.info(f"[FLOW] Step 2/4: Checking idempotency")
             bucket_name = config["GCS_BUCKET"]
             if not check_and_claim_processing(bucket_name, pr_id, commit_sha):
                 logger.info(f"[COMPLETE] PR #{pr_id} @ {commit_sha[:8]} already processed | {elapsed():.0f}ms")
@@ -1102,7 +1177,7 @@ def review_pr_pubsub(cloud_event: CloudEvent) -> None:
                 return  # Already processed - acknowledge and exit
             
             # Fetch file diffs
-            logger.info(f"[FLOW] Step 3/6: Fetching file diffs")
+            logger.info(f"[FLOW] Step 3/4: Fetching file diffs")
             file_diffs = ado.get_pr_diff(pr_id)
             
             if not file_diffs:
@@ -1114,51 +1189,14 @@ def review_pr_pubsub(cloud_event: CloudEvent) -> None:
             
             logger.info(f"[FLOW] Found {len(file_diffs)} files to review")
             
-            # Build prompt and call Gemini
-            logger.info(f"[FLOW] Step 4/6: Building prompt and calling Gemini")
-            prompt = build_review_prompt(pr, file_diffs)
-            logger.info(f"[FLOW] Prompt built: {len(prompt)} chars")
-            
-            review = call_gemini(config, prompt)
-            
-            # Determine severity
-            logger.info(f"[FLOW] Step 5/6: Analyzing severity")
-            max_severity = get_max_severity(review)
-            has_blocking = max_severity == "blocking"
-            has_warning = max_severity == "warning"
-            logger.info(f"[FLOW] Severity: {max_severity.upper()}")
-            
-            # Save to Cloud Storage
-            logger.info(f"[FLOW] Step 6/6: Saving to Cloud Storage and taking action")
-            storage_path = save_to_storage(bucket_name, pr_id, review)
-            
-            # Take action based on severity
-            commented = False
-            
-            if has_blocking or has_warning:
-                logger.info(f"[ACTION] Posting review comment to PR #{pr_id}")
-                comment_header = "## 🤖 Automated Regression Review\n\n"
-                if has_blocking:
-                    comment_header += "⛔ **Sorry Dave, I can't merge you this time. This PR has been automatically rejected due to blocking issues.**\n\n"
-                else:
-                    comment_header += "⚠️ **Warning: This PR has potential issues that should be reviewed.**\n\n"
-                
-                comment_header += f"📁 Full review saved to: `{storage_path}`\n\n---\n\n"
-                
-                ado.post_pr_comment(pr_id, comment_header + review)
-                commented = True
-                logger.info(f"[ACTION] Comment posted successfully")
-                
-                if has_blocking:
-                    logger.info(f"[ACTION] Rejecting PR due to blocking issues")
-                    user_id = ado.get_current_user_id()
-                    ado.reject_pr(pr_id, user_id)
-                    logger.info(f"[ACTION] PR #{pr_id} rejected")
+            # Process the review using shared logic
+            logger.info(f"[FLOW] Step 4/4: Processing review")
+            result = process_pr_review(config, ado, pr_id, pr, file_diffs)
             
             # Update idempotency marker with completion status
-            update_marker_completed(bucket_name, pr_id, commit_sha, max_severity, commented)
+            update_marker_completed(bucket_name, pr_id, commit_sha, result.max_severity, result.commented)
             
-            logger.info(f"[COMPLETE] PR #{pr_id} @ {commit_sha[:8]} review finished | Severity: {max_severity} | {elapsed():.0f}ms")
+            logger.info(f"[COMPLETE] PR #{pr_id} @ {commit_sha[:8]} review finished | Severity: {result.max_severity} | {elapsed():.0f}ms")
             logger.info("=" * 60)
             
         except requests.HTTPError as e:
