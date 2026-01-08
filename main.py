@@ -718,6 +718,15 @@ For each significant finding, use this format:
 - Keep the report under 200 lines total
 - Do not invent issues - only report actual concerns from the diff
 - Be succinct and to the point. Don't be verbose.
+
+## VERY IMPORTANT - Severity Guidelines:
+
+Use the following criteria to determine severity:
+- **blocking**: Security vulnerabilities, breaking changes, data loss risks, or production-breaking bugs
+- **warning**: Code quality issues, performance concerns, potential edge case bugs, or changes requiring extra testing
+- **info**: Minor observations, suggestions for future improvements, or non-critical notes
+
+The main objective is to provide clear impact analysis of changes on the existing codebase. Explain what could break, how it affects users, and the scope of testing needed - so that all developers (especially junior ones) understand the severity and implications of the changes.
 """
 
 

@@ -96,7 +96,7 @@ class TestReviewResult:
             commented=True,
             action_taken="commented",
         )
-        
+
         assert result.pr_id == 12345
         assert result.pr_title == "Test PR"
         assert result.pr_author == "John Doe"
@@ -124,7 +124,7 @@ class TestReviewResult:
             commented=False,
             action_taken=None,
         )
-        
+
         assert result.max_severity == "info"
         assert result.commented is False
         assert result.action_taken is None
@@ -140,7 +140,7 @@ class TestProcessPrReview:
     def test_process_review_blocking_severity(self, ado_client, sample_pr, sample_file_diffs, mocker):
         """process_pr_review returns blocking result and posts comment + rejects PR."""
         config = {"GCS_BUCKET": "test-bucket"}
-        
+
         # Mock Gemini to return blocking review
         mock_review = """# PR Review
 
@@ -153,28 +153,28 @@ This change breaks existing functionality."""
         mocker.patch.object(ado_client, "post_pr_comment")
         mocker.patch.object(ado_client, "get_current_user_id", return_value="user-123")
         mocker.patch.object(ado_client, "reject_pr")
-        
+
         result = process_pr_review(config, ado_client, 12345, sample_pr, sample_file_diffs)
-        
+
         assert result.max_severity == "blocking"
         assert result.has_blocking is True
         assert result.commented is True
         assert result.action_taken == "rejected"
-        
+
         # Verify comment was posted with correct header
         ado_client.post_pr_comment.assert_called_once()
         comment_text = ado_client.post_pr_comment.call_args[0][1]
         assert "RAWL9001" in comment_text
         assert "Sorry Dave" in comment_text
         assert "John Doe" in comment_text  # Author name included
-        
+
         # Verify PR was rejected
         ado_client.reject_pr.assert_called_once_with(12345, "user-123")
 
     def test_process_review_warning_severity(self, ado_client, sample_pr, sample_file_diffs, mocker):
         """process_pr_review returns warning result and posts comment but does not reject."""
         config = {"GCS_BUCKET": "test-bucket"}
-        
+
         mock_review = """# PR Review
 
 ### Finding: Potential issue
@@ -185,27 +185,27 @@ This might cause problems."""
         mocker.patch("main.save_to_storage", return_value="gs://test-bucket/reviews/pr-12345.md")
         mocker.patch.object(ado_client, "post_pr_comment")
         mocker.patch.object(ado_client, "reject_pr")
-        
+
         result = process_pr_review(config, ado_client, 12345, sample_pr, sample_file_diffs)
-        
+
         assert result.max_severity == "warning"
         assert result.has_blocking is False
         assert result.has_warning is True
         assert result.commented is True
         assert result.action_taken == "commented"
-        
+
         # Verify comment was posted
         ado_client.post_pr_comment.assert_called_once()
         comment_text = ado_client.post_pr_comment.call_args[0][1]
         assert "Warning" in comment_text
-        
+
         # Verify PR was NOT rejected
         ado_client.reject_pr.assert_not_called()
 
     def test_process_review_info_severity(self, ado_client, sample_pr, sample_file_diffs, mocker):
         """process_pr_review returns info result with no actions."""
         config = {"GCS_BUCKET": "test-bucket"}
-        
+
         mock_review = """# PR Review
 
 ### Finding: Minor observation
@@ -216,15 +216,15 @@ Just a note."""
         mocker.patch("main.save_to_storage", return_value="gs://test-bucket/reviews/pr-12345.md")
         mocker.patch.object(ado_client, "post_pr_comment")
         mocker.patch.object(ado_client, "reject_pr")
-        
+
         result = process_pr_review(config, ado_client, 12345, sample_pr, sample_file_diffs)
-        
+
         assert result.max_severity == "info"
         assert result.has_blocking is False
         assert result.has_warning is False
         assert result.commented is False
         assert result.action_taken is None
-        
+
         # Verify no comment was posted
         ado_client.post_pr_comment.assert_not_called()
         ado_client.reject_pr.assert_not_called()
@@ -232,12 +232,12 @@ Just a note."""
     def test_process_review_extracts_pr_metadata(self, ado_client, sample_pr, sample_file_diffs, mocker):
         """process_pr_review extracts title and author from PR metadata."""
         config = {"GCS_BUCKET": "test-bucket"}
-        
+
         mocker.patch("main.call_gemini", return_value="# Review\n**Severity:** info")
         mocker.patch("main.save_to_storage", return_value="gs://bucket/path.md")
-        
+
         result = process_pr_review(config, ado_client, 12345, sample_pr, sample_file_diffs)
-        
+
         assert result.pr_title == "Add new feature"
         assert result.pr_author == "John Doe"
         assert result.files_changed == 2  # sample_file_diffs has 2 files
@@ -245,24 +245,24 @@ Just a note."""
     def test_process_review_stores_review_text(self, ado_client, sample_pr, sample_file_diffs, mocker):
         """process_pr_review includes full review text in result."""
         config = {"GCS_BUCKET": "test-bucket"}
-        
+
         expected_review = "# Full Review Content\n\nDetailed analysis here."
         mocker.patch("main.call_gemini", return_value=expected_review)
         mocker.patch("main.save_to_storage", return_value="gs://bucket/path.md")
-        
+
         result = process_pr_review(config, ado_client, 12345, sample_pr, sample_file_diffs)
-        
+
         assert result.review_text == expected_review
 
     def test_process_review_saves_to_storage(self, ado_client, sample_pr, sample_file_diffs, mocker):
         """process_pr_review saves review to cloud storage."""
         config = {"GCS_BUCKET": "my-bucket"}
-        
+
         mocker.patch("main.call_gemini", return_value="# Review")
         mock_save = mocker.patch("main.save_to_storage", return_value="gs://my-bucket/reviews/path.md")
-        
+
         result = process_pr_review(config, ado_client, 12345, sample_pr, sample_file_diffs)
-        
+
         mock_save.assert_called_once_with("my-bucket", 12345, "# Review")
         assert result.storage_path == "gs://my-bucket/reviews/path.md"
 
