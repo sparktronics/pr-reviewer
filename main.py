@@ -712,12 +712,17 @@ For each significant finding, use this format:
 ## Guidelines
 
 - Be specific about file paths and line references
+- Prefer giving a warning over a blocking issue.
 - Prioritize findings by regression risk, not code style. Make sure no breaking changes are missed.
 - Focus on what could break in production, not cosmetic issues
 - If no significant risks found, say so clearly
 - Keep the report under 200 lines total
 - Do not invent issues - only report actual concerns from the diff
 - Be succinct and to the point. Don't be verbose.
+
+## VERY IMPORTANT:
+
+- The main objective is to do an impact analysis of the changes on the existing code base so that junior developers know what could break and how to test it.
 """
 
 
