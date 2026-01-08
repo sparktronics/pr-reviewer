@@ -293,6 +293,44 @@ curl -X POST https://REGION-PROJECT_ID.cloudfunctions.net/pr-regression-review \
 | `VERTEX_LOCATION` | No | GCP region (default: `us-central1`) |
 | `GEMINI_MODEL` | No | Gemini model to use (default: `gemini-2.5-pro`) |
 | `DLQ_SUBSCRIPTION` | No | Dead Letter Queue subscription name (default: `pr-review-dlq-sub`) |
+| `SYSTEM_PROMPT_BLOB_PATH` | No | GCS path to system prompt file (default: `prompts/system-prompt.txt`) |
+
+## System Prompt Configuration
+
+The system prompt can be stored externally in GCS, allowing you to update the review instructions without redeploying the function.
+
+### Initial Upload
+
+The system prompt file is available at `prompts/system-prompt.txt`. Upload it to GCS:
+
+```bash
+# Upload to GCS (replace with your bucket name)
+gsutil cp prompts/system-prompt.txt gs://${GCS_BUCKET}/prompts/system-prompt.txt
+
+# Or with explicit bucket name
+gsutil cp prompts/system-prompt.txt gs://rawl9001/prompts/system-prompt.txt
+
+# Verify upload
+gsutil cat gs://${GCS_BUCKET}/prompts/system-prompt.txt | head -20
+```
+
+### Updating the Prompt
+
+To update the prompt without redeploying:
+
+```bash
+# Edit the file locally
+nano prompts/system-prompt.txt
+
+# Upload the updated version
+gsutil cp prompts/system-prompt.txt gs://${GCS_BUCKET}/prompts/system-prompt.txt
+
+# Changes take effect immediately on the next request
+```
+
+### Fallback Behavior
+
+If the GCS fetch fails (file missing, permissions issue, etc.), the function falls back to the embedded default prompt and logs a warning. This ensures the service remains available even if the external prompt is unavailable.
 
 ## Azure DevOps PAT Permissions
 
