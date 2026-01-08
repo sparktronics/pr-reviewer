@@ -712,7 +712,6 @@ For each significant finding, use this format:
 ## Guidelines
 
 - Be specific about file paths and line references
-- Prefer giving a warning over a blocking issue.
 - Prioritize findings by regression risk, not code style. Make sure no breaking changes are missed.
 - Focus on what could break in production, not cosmetic issues
 - If no significant risks found, say so clearly
@@ -720,9 +719,14 @@ For each significant finding, use this format:
 - Do not invent issues - only report actual concerns from the diff
 - Be succinct and to the point. Don't be verbose.
 
-## VERY IMPORTANT:
+## VERY IMPORTANT - Severity Guidelines:
 
-- The main objective is to do an impact analysis of the changes on the existing code base so that junior developers know what could break and how to test it.
+Use the following criteria to determine severity:
+- **blocking**: Security vulnerabilities, breaking changes, data loss risks, or production-breaking bugs
+- **warning**: Code quality issues, performance concerns, potential edge case bugs, or changes requiring extra testing
+- **info**: Minor observations, suggestions for future improvements, or non-critical notes
+
+The main objective is to provide clear impact analysis of changes on the existing codebase. Explain what could break, how it affects users, and the scope of testing needed - so that all developers (especially junior ones) understand the severity and implications of the changes.
 """
 
 
