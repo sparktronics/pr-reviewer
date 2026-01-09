@@ -138,14 +138,14 @@ class TestProcessPrReview:
     """Tests for process_pr_review shared function."""
 
     def test_process_review_blocking_severity(self, ado_client, sample_pr, sample_file_diffs, mocker):
-        """process_pr_review returns blocking result and posts comment + rejects PR."""
+        """process_pr_review returns action-required result and posts comment + rejects PR."""
         config = {"GCS_BUCKET": "test-bucket"}
 
-        # Mock Gemini to return blocking review
+        # Mock Gemini to return action-required review
         mock_review = """# PR Review
 
 ### Finding: Critical regression
-**Severity:** blocking
+**Priority:** action-required
 
 This change breaks existing functionality."""
         mocker.patch("main.call_gemini", return_value=mock_review)
@@ -156,7 +156,7 @@ This change breaks existing functionality."""
 
         result = process_pr_review(config, ado_client, 12345, sample_pr, sample_file_diffs)
 
-        assert result.max_severity == "blocking"
+        assert result.max_severity == "action-required"
         assert result.has_blocking is True
         assert result.commented is True
         assert result.action_taken == "rejected"
@@ -164,21 +164,21 @@ This change breaks existing functionality."""
         # Verify comment was posted with correct header
         ado_client.post_pr_comment.assert_called_once()
         comment_text = ado_client.post_pr_comment.call_args[0][1]
-        assert "RAWL9001" in comment_text
-        assert "Sorry Dave" in comment_text
+        assert "Automated Regression Review" in comment_text
+        assert "Action required before merge" in comment_text
         assert "John Doe" in comment_text  # Author name included
 
         # Verify PR was rejected
         ado_client.reject_pr.assert_called_once_with(12345, "user-123")
 
     def test_process_review_warning_severity(self, ado_client, sample_pr, sample_file_diffs, mocker):
-        """process_pr_review returns warning result and posts comment but does not reject."""
+        """process_pr_review returns review-recommended result and posts comment but does not reject."""
         config = {"GCS_BUCKET": "test-bucket"}
 
         mock_review = """# PR Review
 
 ### Finding: Potential issue
-**Severity:** warning
+**Priority:** review-recommended
 
 This might cause problems."""
         mocker.patch("main.call_gemini", return_value=mock_review)
@@ -188,7 +188,7 @@ This might cause problems."""
 
         result = process_pr_review(config, ado_client, 12345, sample_pr, sample_file_diffs)
 
-        assert result.max_severity == "warning"
+        assert result.max_severity == "review-recommended"
         assert result.has_blocking is False
         assert result.has_warning is True
         assert result.commented is True
@@ -197,19 +197,19 @@ This might cause problems."""
         # Verify comment was posted
         ado_client.post_pr_comment.assert_called_once()
         comment_text = ado_client.post_pr_comment.call_args[0][1]
-        assert "Warning" in comment_text
+        assert "Review recommended" in comment_text
 
         # Verify PR was NOT rejected
         ado_client.reject_pr.assert_not_called()
 
     def test_process_review_info_severity(self, ado_client, sample_pr, sample_file_diffs, mocker):
-        """process_pr_review returns info result with no actions."""
+        """process_pr_review returns note result with no actions."""
         config = {"GCS_BUCKET": "test-bucket"}
 
         mock_review = """# PR Review
 
 ### Finding: Minor observation
-**Severity:** info
+**Priority:** note
 
 Just a note."""
         mocker.patch("main.call_gemini", return_value=mock_review)
@@ -219,7 +219,7 @@ Just a note."""
 
         result = process_pr_review(config, ado_client, 12345, sample_pr, sample_file_diffs)
 
-        assert result.max_severity == "info"
+        assert result.max_severity == "note"
         assert result.has_blocking is False
         assert result.has_warning is False
         assert result.commented is False
@@ -422,57 +422,57 @@ class TestGetMaxSeverity:
     """Tests for get_max_severity function."""
 
     def test_get_max_severity_blocking(self):
-        """Returns 'blocking' when blocking severity found."""
+        """Returns 'action-required' when action-required priority found."""
         review = """
         # Review
         
         ### Finding: Critical issue
-        **Severity:** blocking
+        **Priority:** action-required
         
-        This is a blocking issue.
+        This is an action-required issue.
         """
-        assert get_max_severity(review) == "blocking"
+        assert get_max_severity(review) == "action-required"
 
     def test_get_max_severity_warning(self):
-        """Returns 'warning' when warning severity found (no blocking)."""
+        """Returns 'review-recommended' when review-recommended priority found (no action-required)."""
         review = """
         # Review
         
         ### Finding: Potential issue
-        **Severity:** warning
+        **Priority:** review-recommended
         
         This could cause problems.
         """
-        assert get_max_severity(review) == "warning"
+        assert get_max_severity(review) == "review-recommended"
 
     def test_get_max_severity_info(self):
-        """Returns 'info' when no blocking or warning found."""
+        """Returns 'note' when no action-required or review-recommended found."""
         review = """
         # Review
         
         ### Finding: Minor note
-        **Severity:** info
+        **Priority:** note
         
         Just an observation.
         """
-        assert get_max_severity(review) == "info"
+        assert get_max_severity(review) == "note"
 
     def test_get_max_severity_blocking_takes_precedence(self):
-        """Returns 'blocking' even when warning is also present."""
+        """Returns 'action-required' even when review-recommended is also present."""
         review = """
         # Review
         
-        ### Finding: Warning issue
-        **Severity:** warning
+        ### Finding: Review recommended issue
+        **Priority:** review-recommended
         
         ### Finding: Critical issue
-        **Severity:** blocking
+        **Priority:** action-required
         """
-        assert get_max_severity(review) == "blocking"
+        assert get_max_severity(review) == "action-required"
 
     def test_get_max_severity_empty_review(self):
-        """Returns 'info' for empty review."""
-        assert get_max_severity("") == "info"
+        """Returns 'note' for empty review."""
+        assert get_max_severity("") == "note"
 
 
 class TestBuildReviewPrompt:
