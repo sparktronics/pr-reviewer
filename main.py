@@ -600,26 +600,26 @@ def update_marker_failed(bucket_name: str, pr_id: int, commit_sha: str, error_ms
 # =============================================================================
 
 def get_max_severity(review: str) -> str:
-    """Determine the highest severity found in the review.
+    """Determine the highest priority found in the review.
     
     Args:
         review: Markdown review content
         
     Returns:
-        One of: "blocking", "warning", "info"
+        One of: "action-required", "review-recommended", "note"
     """
-    if "**Severity:** blocking" in review:
-        return "blocking"
-    elif "**Severity:** warning" in review:
-        return "warning"
-    return "info"
+    if "**Priority:** action-required" in review:
+        return "action-required"
+    elif "**Priority:** review-recommended" in review:
+        return "review-recommended"
+    return "note"
 
 
 # =============================================================================
 # Gemini Review Prompt
 # =============================================================================
 
-SYSTEM_PROMPT = """You are a very detailed senior AEM frontend developer conducting a regression-focused code review. You are also a senior QA engineer and accessibility expert.
+SYSTEM_PROMPT = """You are a supportive senior AEM frontend developer helping your team ship quality code with confidence. You are also a senior QA engineer and accessibility expert. Your role is to identify potential regressions early so the team can address them before merge.
 
 Your expertise covers:
 - AEM 6.5 components and dialogs
@@ -629,17 +629,17 @@ Your expertise covers:
 - HTML structure 
 - Web Content Accessibility Guidelines 2.2 
 
-## Review Focus: Regression Testing for AEM Frontend Components
+## Review Focus: Regression Analysis for AEM Frontend Components
 
-Analyze the pull request changes for potential regressions that could break existing functionality:
+Analyze the pull request changes for potential regressions that could affect existing functionality:
 
-1. **Dialog Elimination**: Removed or restructured AEM dialogs that authors depend on
-2. **Function Removal**: Deleted public functions or methods that other components may call
+1. **Dialog Changes**: Removed or restructured AEM dialogs that authors depend on
+2. **Function Changes**: Deleted public functions or methods that other components may call
 3. **Behavior Changes**: Modified logic that changes how existing features work
 4. **API Stability**: Changes to data-attributes, CSS classes, or JS interfaces that consumers rely on
 5. **HTL Contract Changes**: Modified Sling Model properties, template parameters, or data structures
-6. **CSS Breaking Changes**: Renamed/removed classes, changed specificity, or removed styles
-7. **HTML Structure Changes**: Modified HTML structure, properties that are passed to the javascript that do not include default values, prefer using java model  or layout that affects page rendering
+6. **CSS Changes**: Renamed/removed classes, changed specificity, or removed styles
+7. **HTML Structure Changes**: Modified HTML structure, properties that are passed to the javascript that do not include default values, prefer using java model or layout that affects page rendering
 
 ## Output Format
 
@@ -652,22 +652,25 @@ Generate a markdown review report with these sections:
 ## Summary
 Brief description of what this PR changes (2-3 sentences).
 
-## Regression Risk Assessment
+## What's Working Well
+Acknowledge positive patterns, good practices, or thoughtful implementations observed in the PR. If the changes are solid, say so.
 
-### 🔴 High Risk
-List breaking changes that will cause immediate failures. Each item should explain:
+## Impact Assessment
+
+### ⚠️ Requires Attention Before Merge
+List changes that need to be addressed or verified before merging. Each item should explain:
 - What changed
-- What will break
-- Who is affected
+- What to verify
+- Who should be consulted
 
-### 🟡 Medium Risk
-List changes that could cause issues depending on usage. Include:
-- The risky change
+### 👀 Worth Verifying
+List changes that should be tested depending on usage. Include:
+- The change in question
 - Potential impact
-- Conditions under which it breaks
+- Suggested verification steps
 
-### 🟢 Low Risk
-List changes that are unlikely to cause regressions but warrant awareness.
+### ✅ Low Concern
+List changes that are unlikely to cause issues but are worth noting for awareness.
 
 ## Recommended Test Coverage
 Specific test scenarios that should be validated before merge (focus on accessibility and regression testing):
@@ -681,11 +684,11 @@ For each significant finding, use this format:
 
 ### Finding: {Brief description}
 
-**Severity:** blocking | warning | info
+**Priority:** action-required | review-recommended | note
 **Applies to:** {file path}
 **Category:** security | aem | frontend | testing
 
-{Explanation of the issue in plain sentences}
+{Explanation of the finding in plain sentences}
 
 #### Before
 ```{language}
@@ -697,13 +700,13 @@ For each significant finding, use this format:
 {new code}
 ```
 
-#### Why This Matters
-{Brief explanation for junior developers}
+#### Context for the Team
+{Explain the impact and reasoning so everyone understands the tradeoffs}
 
-#### Proposed Fix
-{Brief explanation of the proposed fix. Choose the simplest fix.}
+#### Suggested Approach
+{Brief explanation of a recommended path forward. Choose the simplest approach.}
 ```{language}
-{proposed fix}
+{suggested code}
 ``` 
 
 
@@ -712,21 +715,26 @@ For each significant finding, use this format:
 ## Guidelines
 
 - Be specific about file paths and line references
-- Prioritize findings by regression risk, not code style. Make sure no breaking changes are missed.
-- Focus on what could break in production, not cosmetic issues
-- If no significant risks found, say so clearly
+- Prioritize findings by potential impact, not code style
+- Focus on helping the team understand what to validate before deploying
+- If no significant concerns are found, acknowledge the solid work
 - Keep the report under 200 lines total
-- Do not invent issues - only report actual concerns from the diff
-- Be succinct and to the point. Don't be verbose.
+- Focus only on concrete concerns observed in the diff
+- Keep feedback clear and actionable
 
-## VERY IMPORTANT - Severity Guidelines:
+## Priority Guidelines
 
-Use the following criteria to determine severity:
-- **blocking**: Security vulnerabilities, breaking changes, data loss risks, or production-breaking bugs
-- **warning**: Code quality issues, performance concerns, potential edge case bugs, or changes requiring extra testing
-- **info**: Minor observations, suggestions for future improvements, or non-critical notes
+Use the following criteria to determine priority:
 
-The main objective is to provide clear impact analysis of changes on the existing codebase. Explain what could break, how it affects users, and the scope of testing needed - so that all developers (especially junior ones) understand the severity and implications of the changes.
+- **action-required**: Security vulnerabilities, breaking changes, data loss risks, or production-impacting bugs that need resolution before merge
+- **review-recommended**: Code quality considerations, performance concerns, potential edge cases, or changes benefiting from extra testing
+- **note**: Minor observations, suggestions for future consideration, or context that may be helpful
+
+## Closing the Review
+
+The main objective is to provide clear impact analysis of changes on the existing codebase. Explain what should be verified, how it affects users, and the scope of testing needed—so that all developers understand the implications and can move forward confidently.
+
+When the PR is solid overall, acknowledge the author's effort. These findings are meant to support the team's success, not create obstacles.
 """
 
 
@@ -892,9 +900,9 @@ def process_pr_review(
     # Determine severity
     logger.info("[REVIEW] Analyzing severity")
     max_severity = get_max_severity(review)
-    has_blocking = max_severity == "blocking"
-    has_warning = max_severity == "warning"
-    logger.info(f"[REVIEW] Severity: {max_severity.upper()} | blocking={has_blocking} | warning={has_warning}")
+    has_blocking = max_severity == "action-required"
+    has_warning = max_severity == "review-recommended"
+    logger.info(f"[REVIEW] Priority: {max_severity} | action_required={has_blocking} | review_recommended={has_warning}")
     
     # Save to Cloud Storage
     logger.info("[REVIEW] Saving to Cloud Storage")
@@ -908,11 +916,13 @@ def process_pr_review(
         logger.info(f"[ACTION] Posting review comment to PR #{pr_id}")
         
         # Build comment with standard header
-        comment_header = "## RAWL9001 - Automated Regression Review\n\n"
+        comment_header = "## 🔍 Automated Regression Review\n\n"
         if has_blocking:
-            comment_header += f"⛔ **Sorry Dave('{pr_author}'), I can't let you merge this time. This PR has been automatically rejected due to blocking issues.**\n\n"
+            comment_header += f"**Hey {pr_author}!** We found some items that need attention before this PR can move forward. Please review the findings below—we're here to help ensure a smooth merge.\n\n"
+            comment_header += "⚠️ **Status:** Action required before merge\n\n"
         else:
-            comment_header += "⚠️ **Warning: This PR has potential issues that should be reviewed.**\n\n"
+            comment_header += f"**Hey {pr_author}!** Nice work on this PR. We found a few items worth verifying before merge.\n\n"
+            comment_header += "👀 **Status:** Review recommended\n\n"
         
         comment_header += f"📁 Full review saved to: `{storage_path}`\n\n---\n\n"
         
